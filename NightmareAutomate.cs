@@ -43,7 +43,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     public override bool Initialise()
     {
         Name = "Nightmare Automate";
-
+        
         // Keep ticking while OUT of game: ExileCore skips plugins entirely when
         // GameController.InGame is false unless Force is set. Without it the
         // SyncTask pump freezes on disconnect and login recovery can never run.

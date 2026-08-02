@@ -114,6 +114,30 @@ public sealed class GameStateService(GameController gc)
         }
     }
 
+    private DateTime _lastAreaRefreshAt = DateTime.MinValue;
+
+    /// <summary>Force the host to re-read the current area and rebuild its caches
+    /// (entity list, terrain, area name/hash) — the recovery for a MISSED area
+    /// change, where searches run against a stale world while IsReady looks fine.
+    /// Heavy (re-fires AreaChange for every plugin, Radar re-paths etc.), so it is
+    /// throttled to once per 10s and meant for retry/escalation paths only, never
+    /// routine checks. Returns whether the refresh actually fired; callers should
+    /// give the host a moment (~1s) to rebuild before re-checking.</summary>
+    public bool TryForceRefreshArea()
+    {
+        if ((DateTime.Now - _lastAreaRefreshAt).TotalSeconds < 10) return false;
+        _lastAreaRefreshAt = DateTime.Now;
+        try
+        {
+            _gc.Area.ForceRefreshArea(true);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>The generic popup window (wave-reward/modifier dialogs) alone —
     /// the one panel class that can sit ABOVE the map device window and swallow
     /// its clicks without the device UI itself counting as "blocking".</summary>

@@ -167,19 +167,31 @@ public sealed class MapDeviceService
         // no spot is remembered — before concluding anything about the device.
         if (_gameState.FindMapDevice() == null && _gameState.IsReady && _gameState.IsInHideout)
         {
-            if (LastKnownDevicePoint is { } knownPoint &&
-                System.Numerics.Vector2.Distance(_gameState.PlayerGridPos, knownPoint) > 40)
+            // The gap may be the HOST's, not distance: a missed area change
+            // leaves searches running against a stale world. A forced re-read
+            // is cheaper than walking -- rule it out before moving anywhere.
+            if (_gameState.TryForceRefreshArea())
             {
-                _log("[MapDevice] Device not in the entity bubble -- walking to where it was last seen.");
-                await _navigation.MoveToTarget(knownPoint, ct, 30);
+                _log("[MapDevice] Entity search came up empty -- forcing an area refresh first.");
+                await Task.Delay(1000, ct);
             }
-            else if (LastKnownDevicePoint == null)
+
+            if (_gameState.FindMapDevice() == null)
             {
-                _log("[MapDevice] Device not in the entity bubble and no remembered spot -- touring the hideout.");
-                var deadline = DateTime.Now.AddMinutes(2);
-                await _exploration.ExploreUntil(
-                    Helpers.WaitHelpers.Throttle(
-                        () => _gameState.FindMapDevice() != null || DateTime.Now > deadline, 250), ct);
+                if (LastKnownDevicePoint is { } knownPoint &&
+                    System.Numerics.Vector2.Distance(_gameState.PlayerGridPos, knownPoint) > 40)
+                {
+                    _log("[MapDevice] Device not in the entity bubble -- walking to where it was last seen.");
+                    await _navigation.MoveToTarget(knownPoint, ct, 30);
+                }
+                else if (LastKnownDevicePoint == null)
+                {
+                    _log("[MapDevice] Device not in the entity bubble and no remembered spot -- touring the hideout.");
+                    var deadline = DateTime.Now.AddMinutes(2);
+                    await _exploration.ExploreUntil(
+                        Helpers.WaitHelpers.Throttle(
+                            () => _gameState.FindMapDevice() != null || DateTime.Now > deadline, 250), ct);
+                }
             }
         }
 

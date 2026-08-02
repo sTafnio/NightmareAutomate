@@ -1013,6 +1013,11 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (run.MapEntryPoint == null && _gameState.GetTownPortals().Count == 0)
         {
             _log("[Simulacrum] No portal discovered this run -- searching the area for it.");
+
+            // Rule out a stale host (missed area change) before walking a tour.
+            if (_gameState.TryForceRefreshArea())
+                await Task.Delay(1000, ct);
+
             await _exploration.ExploreUntil(
                 WaitHelpers.Throttle(() => _gameState.GetTownPortals().Count > 0, 250), ct);
 

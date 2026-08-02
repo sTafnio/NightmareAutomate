@@ -726,9 +726,13 @@ public sealed class FarmingEngine
         else if (_gameState.IsReady && _strategy.IsFarmArea(_gameState.AreaName))
         {
             // No portal in the entity bubble and no (useful) saved entry point —
-            // standing still can never fix that. Walk the exploration tour until
-            // one streams in. Bounded per pass so a genuinely portal-less map
-            // (all six consumed) alerts instead of pacing silently forever.
+            // standing still can never fix that. A stale host is ruled out first
+            // (missed area change), then the exploration tour hunts the portal.
+            // Bounded per pass so a genuinely portal-less map (all six consumed)
+            // alerts instead of pacing silently forever.
+            if (_gameState.TryForceRefreshArea())
+                await Task.Delay(1000, ct);
+
             _log("No portal in sight -- exploring the area to find one.");
             var deadline = DateTime.Now.AddMinutes(3);
             await _exploration.ExploreUntil(
@@ -764,6 +768,16 @@ public sealed class FarmingEngine
         {
             await TaskUtils.NextFrame();
             if (_gameState.IsLoading) continue;
+            if (arrived()) return true;
+        }
+
+        // Timed out: the transition may have HAPPENED without the host noticing
+        // (missed area change leaves CurrentArea/entities stale while IsReady
+        // looks fine). Force a re-read and give it one more chance.
+        if (_gameState.TryForceRefreshArea())
+        {
+            _log("Transition not confirmed -- forced an area refresh to rule out a stale host.");
+            await Task.Delay(1000, ct);
             if (arrived()) return true;
         }
 
