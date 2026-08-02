@@ -20,19 +20,22 @@ public sealed class EventRecovery
     private readonly DiscordWebhookService _webhook;
     private readonly Action<string> _log;
     private readonly Func<Keys> _getHideoutKey;
+    private readonly Func<int> _getMaxReconnectAttempts;
 
     public EventRecovery(
         GameStateService gameState,
         InputService input,
         DiscordWebhookService webhook,
         Action<string> log,
-        Func<Keys> getHideoutKey)
+        Func<Keys> getHideoutKey,
+        Func<int> getMaxReconnectAttempts)
     {
         _gameState = gameState;
         _input = input;
         _webhook = webhook;
         _log = log;
         _getHideoutKey = getHideoutKey;
+        _getMaxReconnectAttempts = getMaxReconnectAttempts;
     }
 
     /// <summary>
@@ -178,14 +181,43 @@ public sealed class EventRecovery
     /// </summary>
     public async SyncTask<BotState> HandleDisconnect(CancellationToken ct)
     {
+        var maxAttempts = _getMaxReconnectAttempts();
         _log("Handling disconnect... pressing Enter to log back in (window must be focused).");
         _webhook.NotifyCritical("Disconnected",
-            "Connection lost. Auto-relogin presses Enter every 5s while the game window is focused.");
+            "Connection lost. Auto-relogin presses Enter while the game window is focused " +
+            "(every 5s at first, backing off to 30s). " +
+            (maxAttempts > 0
+                ? $"Gives up after {maxAttempts} attempts."
+                : "Keeps trying until reconnected."));
 
+        var disconnectedAt = DateTime.Now;
         var lastEnterAt = DateTime.MinValue;
+        var attempts = 0;
+        var nextReminder = TimeSpan.FromMinutes(10);
         var warnedBackground = false;
+
         while (!ct.IsCancellationRequested && !_gameState.IsInGameState)
         {
+            var elapsed = DateTime.Now - disconnectedAt;
+
+            // Periodic reminders: after the first alert, webhook silence must
+            // MEAN "back in game", not "still stuck". 10m, 30m, then hourly.
+            if (elapsed >= nextReminder)
+            {
+                nextReminder = nextReminder.TotalMinutes switch
+                {
+                    < 30 => TimeSpan.FromMinutes(30),
+                    < 60 => TimeSpan.FromMinutes(60),
+                    _ => nextReminder + TimeSpan.FromMinutes(60)
+                };
+                var focusNote = _gameState.IsWindowForeground
+                    ? ""
+                    : " The game window is NOT focused -- no keys can be pressed until it is.";
+                _webhook.NotifyCritical("Still disconnected",
+                    $"{(int)elapsed.TotalMinutes} minutes since the disconnect, " +
+                    $"{attempts} relogin attempts so far.{focusNote}");
+            }
+
             // A real loading screen (character select -> world) -- sit it out.
             if (_gameState.IsLoadingState)
             {
@@ -205,10 +237,34 @@ public sealed class EventRecovery
             }
 
             warnedBackground = false;
-            if ((DateTime.Now - lastEnterAt).TotalSeconds >= 5)
+
+            // Escalating cadence: a quick kick recovers within seconds; a long
+            // outage (realm restart) must not hammer Enter all night.
+            var intervalSeconds = elapsed.TotalMinutes switch
             {
+                < 2 => 5,
+                < 10 => 15,
+                _ => 30
+            };
+
+            if ((DateTime.Now - lastEnterAt).TotalSeconds >= intervalSeconds)
+            {
+                // Only real presses count as attempts -- time spent waiting for
+                // focus or on loading screens never burns the budget.
+                if (maxAttempts > 0 && attempts >= maxAttempts)
+                {
+                    _log($"Could not reconnect after {attempts} attempts -- giving up.");
+                    _webhook.NotifyCritical("Reconnect given up",
+                        $"Still disconnected after {attempts} relogin attempts " +
+                        $"({(int)elapsed.TotalMinutes} minutes) -- stopping the session. " +
+                        "Log back in and restart the bot manually.");
+                    return BotState.Finished;
+                }
+
+                attempts++;
                 lastEnterAt = DateTime.Now;
-                _log("Still disconnected -- pressing Enter (login / character select)...");
+                _log("Still disconnected -- pressing Enter (attempt " +
+                     $"{attempts}{(maxAttempts > 0 ? $"/{maxAttempts}" : "")})...");
                 await _input.PressKeyRaw(Keys.Enter, ct);
             }
 

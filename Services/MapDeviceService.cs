@@ -37,6 +37,7 @@ public sealed class MapDeviceService
     private readonly InventoryService _inventory;
     private readonly NavigationService _navigation;
     private readonly InputService _input;
+    private readonly ExplorationService _exploration;
     private readonly Action<string> _log;
     private readonly Func<Keys> _getInventoryKey;
 
@@ -45,6 +46,7 @@ public sealed class MapDeviceService
         InventoryService inventory,
         NavigationService navigation,
         InputService input,
+        ExplorationService exploration,
         Action<string> log,
         Func<Keys> getInventoryKey)
     {
@@ -52,8 +54,34 @@ public sealed class MapDeviceService
         _inventory = inventory;
         _navigation = navigation;
         _input = input;
+        _exploration = exploration;
         _log = log;
         _getInventoryKey = getInventoryKey;
+    }
+
+    /// <summary>Where the device was last seen, per hideout INSTANCE (area hash).
+    /// Hideout entities stream out with distance in large hideouts: a character
+    /// dropped at the hideout SPAWN (checkpoint resurrect, /hideout from town)
+    /// may not have the device in its entity bubble at all. STATIC so a bot
+    /// restart in the same hideout keeps it; never persisted to disk.</summary>
+    private static uint _deviceAreaHash;
+    private static System.Numerics.Vector2? _devicePointCache;
+
+    private System.Numerics.Vector2? LastKnownDevicePoint
+    {
+        get { EnsureDevicePointIsForCurrentInstance(); return _devicePointCache; }
+        set { EnsureDevicePointIsForCurrentInstance(); _devicePointCache = value; }
+    }
+
+    private void EnsureDevicePointIsForCurrentInstance()
+    {
+        // Only a DIFFERENT hideout instance invalidates — map runs in between
+        // must not wipe the point.
+        if (!_gameState.IsInHideout) return;
+        var hash = _gameState.AreaHash;
+        if (hash == 0 || hash == _deviceAreaHash) return;
+        _deviceAreaHash = hash;
+        _devicePointCache = null;
     }
 
     private Element? AtlasRoot => _gameState.Controller.IngameState?.IngameUi?.Atlas;
@@ -64,6 +92,59 @@ public sealed class MapDeviceService
     public bool IsAtlasOpen => AtlasRoot?.IsVisible == true;
     public bool IsDeviceWindowOpen => DeviceWindow?.IsVisible == true;
 
+    /// <summary>Human-readable description of the last failure's failing STEP —
+    /// surfaced in engine webhooks/logs so a stuck flow says WHY remotely.</summary>
+    public string? LastFailure { get; private set; }
+
+    /// <summary>
+    /// Best-effort UI reset between failed flows: the inventory panel is closed
+    /// via its own key, then Escape clears whatever else is in the way (Atlas,
+    /// device window, reward popups) — the next attempt starts from a clean
+    /// screen instead of clicking into a stale half-open UI. Escape is only
+    /// pressed while something is actually open (with nothing to close it brings
+    /// up the game menu).
+    /// </summary>
+    public async SyncTask<bool> ResetUi(CancellationToken ct)
+    {
+        if (_inventory.IsInventoryPanelOpen)
+        {
+            await _input.PressKey(_getInventoryKey(), ct);
+            await WaitFor(() => !_inventory.IsInventoryPanelOpen, 1000, ct);
+        }
+
+        // A LOADED map slot with its window still open is the one UI state worth
+        // KEEPING between attempts: the retry can click Activate directly, while
+        // closing it strands the fragment in the slot — reopening the window
+        // needs a spare fragment to right-click, and without one the flow is
+        // dead in the water. Only clear popups sitting above it.
+        if (IsDeviceWindowOpen && IsMapSlotLoaded)
+        {
+            for (var i = 0; i < 3 && !ct.IsCancellationRequested; i++)
+            {
+                if (!_gameState.HasPopupOpen) return true;
+                await _input.PressKey(Keys.Escape, ct);
+                await Task.Delay(300, ct);
+                if (!IsDeviceWindowOpen) break; // Escape took the window instead — full reset below
+            }
+            if (IsDeviceWindowOpen && !_gameState.HasPopupOpen) return true;
+        }
+
+        for (var i = 0; i < 3 && !ct.IsCancellationRequested; i++)
+        {
+            if (!IsAtlasOpen && !_gameState.HasBlockingUiPanel)
+                return true;
+            await _input.PressKey(Keys.Escape, ct);
+            await Task.Delay(300, ct);
+        }
+
+        return !IsAtlasOpen && !_gameState.HasBlockingUiPanel;
+    }
+
+    /// <summary>Server-side read of the device's map slot — valid even with every
+    /// panel closed (the game keeps the slot contents between sessions).</summary>
+    private bool IsMapSlotLoaded =>
+        _inventory.MapDeviceMapInventory?.InventorySlotItems?.Count > 0;
+
     /// <summary>
     /// Full flow: open device UI, load items into the map slot, activate, wait for portals.
     /// </summary>
@@ -72,18 +153,73 @@ public sealed class MapDeviceService
         Func<string, bool> isFarmArea,
         CancellationToken ct)
     {
+        // The entity search returns null for reasons that have nothing to do
+        // with the device itself: the game is not ready (loading tail, relogin
+        // limbo, invalid player) or this is not the hideout at all. Ride out
+        // transient states briefly, then report WHICH case it was — a bare
+        // "device missing" sends the operator hunting the wrong problem.
+        await WaitFor(() => _gameState.IsReady && _gameState.FindMapDevice() != null, 5000, ct);
+
+        // Ready and in the hideout, yet no device: in large hideouts entities
+        // stream out with distance, so a character dropped at the hideout SPAWN
+        // (checkpoint resurrect, /hideout) simply cannot SEE the device from
+        // there. Walk back to where it was last seen — or tour the hideout when
+        // no spot is remembered — before concluding anything about the device.
+        if (_gameState.FindMapDevice() == null && _gameState.IsReady && _gameState.IsInHideout)
+        {
+            if (LastKnownDevicePoint is { } knownPoint &&
+                System.Numerics.Vector2.Distance(_gameState.PlayerGridPos, knownPoint) > 40)
+            {
+                _log("[MapDevice] Device not in the entity bubble -- walking to where it was last seen.");
+                await _navigation.MoveToTarget(knownPoint, ct, 30);
+            }
+            else if (LastKnownDevicePoint == null)
+            {
+                _log("[MapDevice] Device not in the entity bubble and no remembered spot -- touring the hideout.");
+                var deadline = DateTime.Now.AddMinutes(2);
+                await _exploration.ExploreUntil(
+                    Helpers.WaitHelpers.Throttle(
+                        () => _gameState.FindMapDevice() != null || DateTime.Now > deadline, 250), ct);
+            }
+        }
+
         var device = _gameState.FindMapDevice();
         if (device == null)
         {
-            _log("[MapDevice] No map device entity found in this area.");
+            var pos = _gameState.PlayerGridPos;
+            var why = !_gameState.IsReady
+                ? "the game is not ready (loading screen, relogin limbo, or an invalid player object)"
+                : !_gameState.IsInHideout
+                    ? $"the current area '{_gameState.AreaName}' is not a hideout"
+                    : $"no entity path matches in '{_gameState.AreaName}' " +
+                      $"({_gameState.Controller.EntityListWrapper.Entities.Count} entities listed, " +
+                      $"player at {(int)pos.X},{(int)pos.Y})";
+            LastFailure = $"No map device entity found -- {why}.";
+            _log($"[MapDevice] {LastFailure}");
             return MapDeviceResult.DeviceNotFound;
+        }
+
+        // Remember the spot for the next time the character strands far away.
+        LastKnownDevicePoint = device.GridPosNum;
+
+        // A blocking panel (wave reward popup, game menu, ...) would swallow the
+        // device click — clear it before the flow starts. The Atlas itself being
+        // open already is fine (the open step verifies and skips).
+        if (!IsAtlasOpen && _gameState.HasBlockingUiPanel)
+        {
+            _log("[MapDevice] A panel is in the way -- pressing Escape to close it.");
+            await _input.PressKey(Keys.Escape, ct);
+            await Task.Delay(300, ct);
         }
 
         // 6s verify: a direct click from across the screen auto-walks the
         // character first; the wait exits early the moment the Atlas opens.
         if (!await RetryStep("Open map device UI", () => IsAtlasOpen,
                 () => _navigation.ClickEntity(device, ct), 6000, ct))
+        {
+            LastFailure = "The map device UI (Atlas) did not open after 3 clicks.";
             return MapDeviceResult.Failed;
+        }
 
         foreach (var path in itemPaths)
         {
@@ -93,7 +229,10 @@ public sealed class MapDeviceService
         }
 
         if (!await ActivateAndWaitForPortals(isFarmArea, ct))
+        {
+            LastFailure = "Clicking Activate never produced new portals.";
             return MapDeviceResult.Failed;
+        }
 
         // A successful activation closes the whole Atlas UI by itself (game feature) —
         // just wait for it so it can't block the portal click. No Escape needed.
@@ -108,6 +247,7 @@ public sealed class MapDeviceService
             await WaitFor(() => !_inventory.IsInventoryPanelOpen, 1500, ct);
         }
 
+        LastFailure = null;
         return MapDeviceResult.Success;
     }
 
@@ -205,7 +345,10 @@ public sealed class MapDeviceService
             else if (_inventory.FindMainInventoryItem(itemPath) != null)
             {
                 if (!await EnsureInventoryPanelOpen(ct))
+                {
+                    LastFailure = "The inventory panel did not open.";
                     return MapDeviceResult.Failed;
+                }
 
                 opened = await RetryStep("Open device window (right-click inventory fragment)",
                     () => IsDeviceWindowOpen,
@@ -214,12 +357,17 @@ public sealed class MapDeviceService
             }
             else
             {
+                LastFailure = "The map slot is loaded but the device window is closed and no spare fragment exists to open it with.";
                 _log("[MapDevice] Slot is loaded but the device window is closed and no " +
                      $"fragment exists to open it with. Open it manually once. {UiState(itemPath)}");
                 return MapDeviceResult.Failed;
             }
 
-            if (!opened) return MapDeviceResult.Failed;
+            if (!opened)
+            {
+                LastFailure = "The map device window did not open (right-clicking the fragment never registered).";
+                return MapDeviceResult.Failed;
+            }
             await Task.Delay(1000, ct); // window settle before reading its inventories
         }
 
@@ -228,27 +376,35 @@ public sealed class MapDeviceService
         // Step 2: ctrl-click a fragment into the map slot — storage first, inventory fallback.
         if (IsInStorage(itemPath))
         {
-            return await RetryStep("Load map slot (ctrl-click storage fragment)",
-                () => IsInMapSlot(itemPath),
-                () => ClickStorageFragment(itemPath, MouseButtons.Left, ctrl: true, ct),
-                3000, ct, itemPath: itemPath)
-                ? MapDeviceResult.Success
-                : MapDeviceResult.Failed;
+            if (await RetryStep("Load map slot (ctrl-click storage fragment)",
+                    () => IsInMapSlot(itemPath),
+                    () => ClickStorageFragment(itemPath, MouseButtons.Left, ctrl: true, ct),
+                    3000, ct, itemPath: itemPath))
+                return MapDeviceResult.Success;
+
+            LastFailure = "Ctrl-clicking the storage fragment into the map slot never registered.";
+            return MapDeviceResult.Failed;
         }
 
         if (_inventory.FindMainInventoryItem(itemPath) != null)
         {
             if (!await EnsureInventoryPanelOpen(ct))
+            {
+                LastFailure = "The inventory panel did not open.";
                 return MapDeviceResult.Failed;
+            }
 
-            return await RetryStep("Load map slot (ctrl-click inventory fragment)",
-                () => IsInMapSlot(itemPath),
-                () => ClickInventoryFragment(itemPath, MouseButtons.Left, ctrl: true, ct),
-                3000, ct, itemPath: itemPath)
-                ? MapDeviceResult.Success
-                : MapDeviceResult.Failed;
+            if (await RetryStep("Load map slot (ctrl-click inventory fragment)",
+                    () => IsInMapSlot(itemPath),
+                    () => ClickInventoryFragment(itemPath, MouseButtons.Left, ctrl: true, ct),
+                    3000, ct, itemPath: itemPath))
+                return MapDeviceResult.Success;
+
+            LastFailure = "Ctrl-clicking the inventory fragment into the map slot never registered.";
+            return MapDeviceResult.Failed;
         }
 
+        LastFailure = "The fragment vanished mid-flow.";
         _log($"[MapDevice] Fragment vanished mid-flow. {UiState(itemPath)}");
         return MapDeviceResult.Failed;
     }

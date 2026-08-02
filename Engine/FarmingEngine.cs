@@ -23,9 +23,22 @@ public sealed class FarmingEngine
     /// <summary>How many engine-triggered chore attempts may fail before backing off.</summary>
     private const int MaxStashFailures = 3;
 
+    /// <summary>Hard cap on stash attempts while the inventory is FULL — there is
+    /// no backing off in that state (farming blind), so this many failures in a
+    /// row stops the session loudly instead of wasting hours.</summary>
+    private const int MaxUrgentStashFailures = 10;
+
+    /// <summary>Escalating chore backoff per streak: 30s, 60s, then 120s capped.</summary>
+    private static readonly int[] StashBackoffSeconds = [30, 60, 120];
+
     /// <summary>How often a NoFragments verdict may send the engine back into a
     /// stash-restock retry before the session is declared over for real.</summary>
     private const int MaxRestockRetries = 3;
+
+    /// <summary>Map-device flow failures in a row that stop the session — without
+    /// a working device there is nothing to farm, and endless silent retries
+    /// would waste hours.</summary>
+    private const int MaxMapDeviceFailures = 10;
 
     private readonly IFarmStrategy _strategy;
     private readonly NavigationService _navigation;
@@ -35,14 +48,21 @@ public sealed class FarmingEngine
     private readonly EventRecovery _recovery;
     private readonly DiscordWebhookService _webhook;
     private readonly SessionStats _stats;
+    private readonly Services.ExplorationService _exploration;
     private readonly Action<string> _log;
     private readonly Func<int> _getMaxRuns;
+
+    private bool _noReturnPortalNotified;
 
     private DateTime _portalWaitStartedAt = DateTime.MinValue;
 
     private int _stashFailuresInARow;
     private DateTime _stashBackoffUntil = DateTime.MinValue;
+    private int _stashBackoffLevel;
+    private bool _stashTroubleNotified;
     private int _restockRetries;
+    private int _mapDeviceFailuresInARow;
+    private bool _mapDeviceTroubleNotified;
 
     // Notification bookkeeping: per-run values are deltas against these
     // snapshots (taken whenever a run starts or is adopted).
@@ -100,6 +120,7 @@ public sealed class FarmingEngine
         EventRecovery recovery,
         DiscordWebhookService webhook,
         SessionStats stats,
+        Services.ExplorationService exploration,
         Action<string> log,
         Func<int> getMaxRuns)
     {
@@ -111,6 +132,7 @@ public sealed class FarmingEngine
         _recovery = recovery;
         _webhook = webhook;
         _stats = stats;
+        _exploration = exploration;
         _log = log;
         _getMaxRuns = getMaxRuns;
     }
@@ -174,7 +196,7 @@ public sealed class FarmingEngine
                         BotState.RunningFarm => await DoRunningFarm(stepCt),
                         BotState.ReturningToHideout => await DoReturningToHideout(stepCt),
                         BotState.Dead => await _recovery.HandleDeath(stepCt),
-                        BotState.Disconnected => await _recovery.HandleDisconnect(stepCt),
+                        BotState.Disconnected => await DoDisconnected(stepCt),
                         BotState.Finished => BotState.Finished,
                         _ => BotState.Error
                     };
@@ -245,7 +267,10 @@ public sealed class FarmingEngine
         lines.Add($"Portals used: {Context.PortalsUsed}/{RunContext.MaxPortals}");
         lines.Add($"Gems leveled: {_stats.GemsLeveled - _runStartGems}");
 
-        _webhook.NotifySummary($"Run #{Context.RunsCompleted} complete", string.Join("\n", lines));
+        var title = Context.AbandonedByTimer
+            ? $"Run #{Context.RunsCompleted} abandoned (time limit)"
+            : $"Run #{Context.RunsCompleted} complete";
+        _webhook.NotifySummary(title, string.Join("\n", lines));
     }
 
     private void SendSessionSummary()
@@ -318,9 +343,24 @@ public sealed class FarmingEngine
             Context.RunActive = false;
         }
 
+        // A standing tab-settings problem WITH a full inventory: the config latch
+        // keeps the stash chores off (retrying can't fix a wrong tab name), but
+        // farming on in this state means no loot gets picked — stop loudly
+        // instead. (The latch lifts on its own when the settings change.)
+        if (_chores.ConfigErrorStanding && _chores.UrgentStashPending)
+        {
+            var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
+            _log($"Stash settings problem with a FULL inventory -- stopping. {detail}");
+            _webhook.NotifyCritical("Stash settings problem",
+                $"{detail} The inventory is full, so farming on cannot pick loot -- session stopped. " +
+                "Fix the tab settings and restart.");
+            _finishReason = "Stash settings problem with a full inventory.";
+            return BotState.Finished;
+        }
+
         // Chores (stash dump, gem level-ups, fragment restock) that
         // keep failing must not loop the InHideout<->Stashing states forever --
-        // back off and farm on.
+        // back off (escalating) and farm on.
         if (DateTime.Now >= _stashBackoffUntil && _chores.HasPending(_strategy.MapDeviceItemPaths))
             return BotState.Stashing;
 
@@ -348,29 +388,96 @@ public sealed class FarmingEngine
 
             case ChoresResult.Done:
                 _stashFailuresInARow = 0;
+                _stashBackoffLevel = 0;
+                _stashTroubleNotified = false;
                 _restockRetries = 0;
                 break;
 
-            default:
-                if (++_stashFailuresInARow >= MaxStashFailures)
+            case ChoresResult.ConfigError:
+            {
+                // A wrong tab name never fixes itself by waiting — alert once and
+                // pause the chores (HasPending) until the settings change. With a
+                // FULL inventory even farming on is pointless: loot can no longer
+                // be picked, so stop the session instead.
+                _stashFailuresInARow = 0;
+                var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
+                if (_chores.UrgentStashPending)
                 {
-                    _stashFailuresInARow = 0;
-                    _stashBackoffUntil = DateTime.Now.AddMinutes(5);
-                    _log($"Chores failed {MaxStashFailures}x in a row -- backing off for 5 minutes. Check the stash settings.");
-                    _webhook.NotifyCritical("Stash trouble",
-                        $"Stash chores failed {MaxStashFailures}x in a row -- backing off for 5 minutes. " +
-                        "Stash unreachable or tab settings off; loot dumps and fragment restocks are delayed.");
+                    _log($"Stash settings problem with a FULL inventory -- stopping. {detail}");
+                    _webhook.NotifyCritical("Stash settings problem",
+                        $"{detail} The inventory is full, so farming on cannot pick loot -- session stopped. " +
+                        "Fix the tab settings and restart.");
+                    _finishReason = "Stash settings problem with a full inventory.";
+                    return BotState.Finished;
                 }
-                else
+
+                _log($"Chores blocked by a settings problem -- {detail} Paused until the settings change.");
+                _webhook.NotifyCritical("Stash settings problem",
+                    $"{detail} Stashing is paused until the settings change -- retrying cannot fix a wrong tab name.");
+                break;
+            }
+
+            default:
+            {
+                _stashFailuresInARow++;
+                var detail = _chores.LastFailureDetail ?? "unknown step";
+
+                // Pace the first retries: a transient failure (entities still
+                // streaming in, UI settling) must not burn all attempts within a
+                // few frames.
+                if (_stashFailuresInARow < MaxStashFailures)
                 {
-                    // Pace the retries: a transient failure (entities still
-                    // streaming in, UI settling) must not burn all attempts
-                    // within a few frames.
-                    _log("Chores failed -- retrying shortly.");
+                    _log($"Chores failed ({detail}) -- retrying shortly.");
                     await Task.Delay(2000, ct);
+                    break;
+                }
+
+                if (_chores.UrgentStashPending)
+                {
+                    // NEVER back off with a full inventory — every backed-off wave
+                    // farms blind (loot cannot be picked). Keep retrying, alert
+                    // once, and stop loudly when it clearly will not recover.
+                    if (_stashFailuresInARow >= MaxUrgentStashFailures)
+                    {
+                        _log($"Stash unreachable with a FULL inventory ({_stashFailuresInARow}x) -- stopping.");
+                        _webhook.NotifyCritical("Stash unreachable",
+                            $"Stash chores failed {_stashFailuresInARow}x in a row with a FULL inventory " +
+                            $"({detail}) -- stopping the session so it does not farm blind for hours.");
+                        _finishReason = "Stash unreachable with a full inventory.";
+                        return BotState.Finished;
+                    }
+
+                    if (!_stashTroubleNotified)
+                    {
+                        _stashTroubleNotified = true;
+                        _webhook.NotifyCritical("Stash trouble",
+                            $"Stash chores keep failing ({detail}) and the inventory is FULL -- " +
+                            "retrying instead of backing off; will stop if it cannot recover.");
+                    }
+
+                    _log($"Chores failed {_stashFailuresInARow}x with a full inventory ({detail}) -- retrying (no backoff while full).");
+                    await Task.Delay(2000, ct);
+                    break;
+                }
+
+                // Escalating backoff (30s → 60s → 120s) instead of a flat 5 minutes:
+                // transient causes clear in seconds; persistent ones alert via
+                // webhook with the failing step so the settings can be fixed.
+                var backoffSeconds = StashBackoffSeconds[Math.Min(_stashBackoffLevel, StashBackoffSeconds.Length - 1)];
+                _stashBackoffLevel++;
+                _stashFailuresInARow = 0;
+                _stashBackoffUntil = DateTime.Now.AddSeconds(backoffSeconds);
+                _log($"Chores failed {MaxStashFailures}x in a row ({detail}) -- backing off for {backoffSeconds}s.");
+                if (!_stashTroubleNotified)
+                {
+                    _stashTroubleNotified = true;
+                    _webhook.NotifyCritical("Stash trouble",
+                        $"Stash chores failed {MaxStashFailures}x in a row ({detail}) -- backing off for " +
+                        $"{backoffSeconds}s (escalating). Loot dumps and fragment restocks are delayed.");
                 }
 
                 break;
+            }
         }
 
         return BotState.InHideout;
@@ -396,6 +503,8 @@ public sealed class FarmingEngine
                 Context.RunActive = true;
                 BeginRunTracking();
                 _restockRetries = 0;
+                _mapDeviceFailuresInARow = 0;
+                _mapDeviceTroubleNotified = false;
                 _ignoreExistingPortals = false; // fresh portals from here on
                 _portalWaitStartedAt = DateTime.Now;
                 return BotState.WaitingForPortal;
@@ -428,9 +537,48 @@ public sealed class FarmingEngine
                 return BotState.Finished;
 
             default:
-                _log("Map device flow failed. Retrying shortly...");
-                await Task.Delay(2000, ct);
+            {
+                // Same failsafe shape as the stash chores: reset the UI between
+                // attempts (a stale half-open Atlas or a reward popup swallows
+                // clicks), escalate the pacing, alert once via webhook, and stop
+                // the session instead of silently retrying for hours.
+                _mapDeviceFailuresInARow++;
+                var detail = _mapDevice.LastFailure ?? "unknown step";
+
+                // A device failure while demonstrably NOT in the hideout is a
+                // routing problem, not a device problem — go home through the
+                // existing machinery instead of retrying in the wrong area.
+                // (Still counted, so a broken route cannot loop forever.)
+                if (_mapDeviceFailuresInARow < MaxMapDeviceFailures &&
+                    _gameState.IsReady && !_gameState.IsInHideout)
+                {
+                    _log($"Map device flow failed outside the hideout ('{_gameState.AreaName}') -- routing home first.");
+                    return BotState.ReturningToHideout;
+                }
+
+                if (_mapDeviceFailuresInARow >= MaxMapDeviceFailures)
+                {
+                    _log($"Map device flow failed {_mapDeviceFailuresInARow}x in a row ({detail}) -- stopping.");
+                    _webhook.NotifyCritical("Map device unreachable",
+                        $"Opening a map failed {_mapDeviceFailuresInARow}x in a row ({detail}) -- " +
+                        "stopping the session. Check the hideout/device manually.");
+                    _finishReason = "Map device flow kept failing.";
+                    return BotState.Finished;
+                }
+
+                if (_mapDeviceFailuresInARow == 3 && !_mapDeviceTroubleNotified)
+                {
+                    _mapDeviceTroubleNotified = true;
+                    _webhook.NotifyCritical("Map device trouble",
+                        $"Opening a map has failed 3x in a row ({detail}) -- resetting the UI and retrying; " +
+                        $"will stop after {MaxMapDeviceFailures} failures.");
+                }
+
+                _log($"Map device flow failed ({detail}) -- resetting the UI and retrying shortly.");
+                await _mapDevice.ResetUi(ct);
+                await Task.Delay(_mapDeviceFailuresInARow >= 3 ? 10000 : 2000, ct);
                 return BotState.InHideout;
+            }
         }
     }
 
@@ -529,11 +677,22 @@ public sealed class FarmingEngine
         return BotState.RunningFarm;
     }
 
+    /// <summary>Thin wrapper so a reconnect give-up (Finished) carries a session
+    /// summary reason -- the recovery service cannot reach _finishReason itself.</summary>
+    private async SyncTask<BotState> DoDisconnected(CancellationToken ct)
+    {
+        var next = await _recovery.HandleDisconnect(ct);
+        if (next == BotState.Finished)
+            _finishReason = "Could not reconnect (relogin attempt limit reached).";
+        return next;
+    }
+
     private async SyncTask<BotState> DoReturningToHideout(CancellationToken ct)
     {
         if (_gameState.IsInHideout)
         {
             _log("Back in hideout.");
+            _noReturnPortalNotified = false;
             return BotState.InHideout;
         }
 
@@ -563,6 +722,26 @@ public sealed class FarmingEngine
             // The return portals stand at the map entry but stream in only when close.
             _log("Walking back to the map entry point...");
             await _navigation.MoveToTarget(entry, ct, 25);
+        }
+        else if (_gameState.IsReady && _strategy.IsFarmArea(_gameState.AreaName))
+        {
+            // No portal in the entity bubble and no (useful) saved entry point —
+            // standing still can never fix that. Walk the exploration tour until
+            // one streams in. Bounded per pass so a genuinely portal-less map
+            // (all six consumed) alerts instead of pacing silently forever.
+            _log("No portal in sight -- exploring the area to find one.");
+            var deadline = DateTime.Now.AddMinutes(3);
+            await _exploration.ExploreUntil(
+                Helpers.WaitHelpers.Throttle(
+                    () => _gameState.GetTownPortals().Count > 0 || DateTime.Now > deadline, 250), ct);
+
+            if (_gameState.GetTownPortals().Count == 0 && !_noReturnPortalNotified)
+            {
+                _noReturnPortalNotified = true;
+                _webhook.NotifyCritical("Stuck in map",
+                    "The run is over but no return portal was found even after exploring the area " +
+                    "for 3 minutes. The search continues -- a manual portal scroll or logout may be needed.");
+            }
         }
         else
         {

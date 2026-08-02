@@ -32,6 +32,15 @@ public sealed class RunContext
     /// to react to clicks. The run stays active; portals get consumed as usual.</summary>
     public bool ReEntryRequested { get; set; }
 
+    /// <summary>Wall-clock start of this run (set on activation/adoption).
+    /// Deaths and hideout trips mid-run do NOT reset it — the abandon timer
+    /// measures total time spent on the run, not time inside the map.</summary>
+    public System.DateTime RunStartedAt { get; set; }
+
+    /// <summary>The per-run time limit fired: the run was walked out of and
+    /// reported as complete without clearing all waves.</summary>
+    public bool AbandonedByTimer { get; set; }
+
     public void ResetForNewRun()
     {
         RunActive = false;
@@ -39,5 +48,7 @@ public sealed class RunContext
         WavesStarted = 0;
         MapEntryPoint = null;
         ReEntryRequested = false;
+        RunStartedAt = System.DateTime.Now;
+        AbandonedByTimer = false;
     }
 }

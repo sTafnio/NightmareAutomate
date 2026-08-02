@@ -15,8 +15,14 @@ public enum ChoresResult
     /// session is out of fragments.</summary>
     OutOfFragments,
 
-    /// <summary>The stash session could not run (panel would not open, dump failed).</summary>
-    Failed
+    /// <summary>The stash session could not run (panel would not open, dump failed).
+    /// Transient — retrying can help.</summary>
+    Failed,
+
+    /// <summary>The tab settings are wrong (missing dump tabs / restock tab).
+    /// Retrying cannot help — only a settings change can. Chores stay paused
+    /// (HasPending returns false) until the relevant settings actually change.</summary>
+    ConfigError
 }
 
 /// <summary>
@@ -34,6 +40,42 @@ public sealed class ChoresService
     private readonly Action<string> _log;
 
     private DateTime _gemAttemptAt = DateTime.MinValue;
+
+    /// <summary>The tab settings as they were when a ConfigError was reported —
+    /// while they are unchanged, retrying is pointless and chores stay paused.
+    /// Settings are live-editable, so a user fixing the tab name resumes chores
+    /// automatically.</summary>
+    private string? _configErrorSnapshot;
+
+    private string ConfigSnapshot => $"{_settings.DumpTabNames}|{_settings.SimulacrumTabName}";
+
+    /// <summary>Failing-step description of the last failed/misconfigured chore —
+    /// forwarded into engine webhooks.</summary>
+    public string? LastFailureDetail { get; private set; }
+
+    /// <summary>The inventory is completely full — the state where skipping or
+    /// backing off stash chores means farming blind (loot can no longer be picked).</summary>
+    public bool UrgentStashPending => _stashService.ShouldStash();
+
+    /// <summary>A reported tab-settings problem still stands (the settings have not
+    /// changed since). The engine uses this to stop the session when it coincides
+    /// with a full inventory instead of farming blind.</summary>
+    public bool ConfigErrorStanding
+    {
+        get
+        {
+            RefreshConfigLatch();
+            return _configErrorSnapshot != null;
+        }
+    }
+
+    /// <summary>Settings are live-editable — a latch whose snapshot no longer
+    /// matches them is stale and must lift so chores resume automatically.</summary>
+    private void RefreshConfigLatch()
+    {
+        if (_configErrorSnapshot != null && _configErrorSnapshot != ConfigSnapshot)
+            _configErrorSnapshot = null;
+    }
 
     public ChoresService(
         StashService stashService,
@@ -89,8 +131,15 @@ public sealed class ChoresService
         if ((DateTime.Now - _pendingCheckedAt).TotalSeconds < 1)
             return _pendingLast;
 
+        // A standing config error pauses the STASH-bound chores — retrying a
+        // wrong tab name is pointless until the settings change. Gems don't need
+        // the stash and keep running.
+        RefreshConfigLatch();
+
         _pendingCheckedAt = DateTime.Now;
-        return _pendingLast = NeedStash || NeedGems || NeedFragments(fragmentPaths);
+        return _pendingLast = NeedGems ||
+                              (_configErrorSnapshot == null &&
+                               (NeedStash || NeedFragments(fragmentPaths)));
     }
 
     /// <summary>
@@ -98,8 +147,12 @@ public sealed class ChoresService
     /// </summary>
     public async SyncTask<ChoresResult> Run(IReadOnlyList<string> fragmentPaths, CancellationToken ct)
     {
-        var needStash = NeedStash;
-        var needFragments = NeedFragments(fragmentPaths);
+        // While a config error stands, the stash-bound chores stay off (gems still
+        // run) — re-attempting them would just re-fail and re-alert every visit.
+        RefreshConfigLatch();
+        var configBlocked = _configErrorSnapshot != null;
+        var needStash = !configBlocked && NeedStash;
+        var needFragments = !configBlocked && NeedFragments(fragmentPaths);
         if (!needStash && !needFragments)
         {
             await LevelGemsIfPending(ct);
@@ -107,16 +160,28 @@ public sealed class ChoresService
         }
 
         if (!await _stashService.OpenStashPanel(ct))
+        {
+            LastFailureDetail = _stashService.LastFailure;
             return ChoresResult.Failed;
+        }
 
         var failed = false;
+        var configError = false;
         var outOfFragments = false;
         try
         {
-            if (needStash && !await _stashService.Execute(ct, keepOpen: true))
-                failed = true;
+            if (needStash)
+            {
+                var dump = await _stashService.Execute(ct, keepOpen: true);
+                if (dump != StashResult.Ok)
+                {
+                    LastFailureDetail = _stashService.LastFailure;
+                    if (dump == StashResult.ConfigError) configError = true;
+                    else failed = true;
+                }
+            }
 
-            if (needFragments)
+            if (needFragments && !configError)
             {
                 foreach (var path in fragmentPaths)
                 {
@@ -129,9 +194,11 @@ public sealed class ChoresService
                         break;
                     }
 
-                    if (pull == PullResult.Failed)
+                    if (pull is PullResult.Failed or PullResult.ConfigError)
                     {
-                        failed = true;
+                        LastFailureDetail = _stashService.LastFailure;
+                        if (pull == PullResult.ConfigError) configError = true;
+                        else failed = true;
                         break;
                     }
                 }
@@ -147,7 +214,15 @@ public sealed class ChoresService
         await LevelGemsIfPending(ct);
 
         if (outOfFragments) return ChoresResult.OutOfFragments;
-        return failed ? ChoresResult.Failed : ChoresResult.Done;
+        if (configError)
+        {
+            _configErrorSnapshot = ConfigSnapshot;
+            return ChoresResult.ConfigError;
+        }
+
+        if (failed) return ChoresResult.Failed;
+        LastFailureDetail = null;
+        return ChoresResult.Done;
     }
 
     private async SyncTask<bool> LevelGemsIfPending(CancellationToken ct)

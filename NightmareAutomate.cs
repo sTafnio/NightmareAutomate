@@ -74,11 +74,14 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             msg => _overlay.Log(msg),
             () => Settings.ToggleLabelsKey.Value.Key);
 
+        _exploration = new ExplorationService(_gameState, _navigation, msg => _overlay.Log(msg));
+
         _mapDevice = new MapDeviceService(
             _gameState,
             _inventory,
             _navigation,
             _input,
+            _exploration,
             msg => _overlay.Log(msg),
             () => Settings.InventoryKey.Value.Key);
 
@@ -100,9 +103,8 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             _input,
             _webhook,
             msg => _overlay.Log(msg),
-            () => Settings.HideoutKey.Value.Key);
-
-        _exploration = new ExplorationService(_gameState, _navigation, msg => _overlay.Log(msg));
+            () => Settings.HideoutKey.Value.Key,
+            () => Settings.MaxReconnectAttempts);
 
         _stats = new Models.SessionStats();
 
@@ -229,6 +231,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
                 _recovery,
                 _webhook,
                 _stats,
+                _exploration,
                 _overlay.Log,
                 () => Settings.MaxRuns);
 

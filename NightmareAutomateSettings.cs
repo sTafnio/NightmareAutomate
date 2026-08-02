@@ -51,6 +51,13 @@ public class NightmareAutomateSettings : ISettings
 
     public int PathLookahead { get; set; } = 20;
 
+    // --- Recovery ---
+
+    /// <summary>Enter presses to attempt after a disconnect before the session is
+    /// stopped (cadence escalates 5s → 15s → 30s; waiting for window focus or on
+    /// loading screens does not count). 0 = keep trying forever.</summary>
+    public int MaxReconnectAttempts { get; set; } = 150;
+
     // --- Simulacrum ---
 
     public int HoverRange { get; set; } = 35;
@@ -77,6 +84,11 @@ public class NightmareAutomateSettings : ISettings
     public int LootSpawnWaitSeconds { get; set; } = 5;
 
     public int LateLootLingerSeconds { get; set; } = 5;
+
+    /// <summary>Hard per-run time limit in minutes: past it the run is abandoned
+    /// (leave, treat as completed, open the next Simulacrum). Guards against
+    /// effectively-unkillable rare mod rolls. 0 = no limit.</summary>
+    public int AbandonRunAfterMinutes { get; set; } = 45;
 
     // --- Automation ---
 

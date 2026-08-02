@@ -19,7 +19,24 @@ public enum PullResult
     Empty,
 
     /// <summary>The stash/tab/click flow itself failed — says nothing about stock.</summary>
-    Failed
+    Failed,
+
+    /// <summary>The configured tab does not exist — no retry can fix this, only a
+    /// settings change.</summary>
+    ConfigError
+}
+
+public enum StashResult
+{
+    /// <summary>Everything dumpable was deposited.</summary>
+    Ok,
+
+    /// <summary>A transient flow failure (panel, clicks, full tabs) — retryable.</summary>
+    Failed,
+
+    /// <summary>The dump-tab settings are wrong (none configured / none exist) —
+    /// no retry can fix this, only a settings change.</summary>
+    ConfigError
 }
 
 /// <summary>
@@ -58,6 +75,11 @@ public sealed class StashService
 
     private StashElement? Stash => _gameState.Controller.IngameState?.IngameUi?.StashElement;
 
+    /// <summary>Human-readable description of the last failure's failing STEP —
+    /// surfaced in engine webhooks so a remote user can tell a settings problem
+    /// from a transient UI hiccup. Set at every failure site, cleared on success.</summary>
+    public string? LastFailure { get; private set; }
+
     public bool IsStashPanelOpen => Stash?.IsVisible == true;
 
     /// <summary>The currently visible stash tab's UI inventory (item elements with
@@ -83,24 +105,27 @@ public sealed class StashService
     /// Full deposit flow: walk to stash, open it, dump into the configured tabs in
     /// order (next tab when one fills up), close. keepOpen leaves the panel up so
     /// the caller can run more stash work (fragment restock) in the
-    /// same session.
+    /// same session. ConfigError (no dump tabs set / none of them exist) is kept
+    /// apart from transient failures — waiting cannot fix a wrong tab name.
     /// </summary>
-    public async SyncTask<bool> Execute(CancellationToken ct, bool keepOpen = false)
+    public async SyncTask<StashResult> Execute(CancellationToken ct, bool keepOpen = false)
     {
         if (_inventory.GetDumpableItems().Count == 0)
-            return true;
-
-        if (!await OpenStashPanel(ct))
-            return false;
+            return StashResult.Ok;
 
         var tabNames = DumpTabNames;
         if (tabNames.Count == 0)
         {
-            _log("[Stash] No dump tabs configured -- set 'Dump Tab Names' in the settings.");
-            return false;
+            LastFailure = "No dump tabs configured -- set 'Dump Tab Names' in the settings.";
+            _log($"[Stash] {LastFailure}");
+            return StashResult.ConfigError;
         }
 
+        if (!await OpenStashPanel(ct))
+            return StashResult.Failed;
+
         var dumpedEverything = false;
+        var anyTabFound = false;
         foreach (var tabName in tabNames)
         {
             if (ct.IsCancellationRequested) break;
@@ -112,6 +137,7 @@ public sealed class StashService
                 continue;
             }
 
+            anyTabFound = true;
             if (!await SwitchToTab(tabIndex, ct))
             {
                 _log($"[Stash] Could not switch to tab '{tabName}'.");
@@ -129,16 +155,26 @@ public sealed class StashService
             _log($"[Stash] Tab '{tabName}' is full (or items bounced) -- trying the next dump tab.");
         }
 
-        if (!dumpedEverything)
-        {
-            var left = _inventory.GetDumpableItems().Count;
-            if (left > 0)
-                _log($"[Stash] {left} items could not be deposited -- all dump tabs full?");
-        }
-
         if (!keepOpen)
             await ClosePanel(ct);
-        return dumpedEverything || _inventory.GetDumpableItems().Count == 0;
+
+        if (dumpedEverything || _inventory.GetDumpableItems().Count == 0)
+        {
+            LastFailure = null;
+            return StashResult.Ok;
+        }
+
+        if (!anyTabFound)
+        {
+            LastFailure = $"None of the dump tabs ('{string.Join("', '", tabNames)}') exist in the stash -- check 'Dump Tab Names'.";
+            _log($"[Stash] {LastFailure}");
+            return StashResult.ConfigError;
+        }
+
+        var left = _inventory.GetDumpableItems().Count;
+        LastFailure = $"{left} items could not be deposited -- all dump tabs full?";
+        _log($"[Stash] {LastFailure}");
+        return StashResult.Failed;
     }
 
     /// <summary>
@@ -186,7 +222,21 @@ public sealed class StashService
     public async SyncTask<PullResult> PullItemFromTab(string tabName, string itemPathFragment, CancellationToken ct)
     {
         if (!await OpenStashPanel(ct)) return PullResult.Failed;
-        if (!await SwitchToTabByName(tabName, ct)) return PullResult.Failed;
+
+        // A missing tab is a settings problem, not a flow failure — the caller
+        // must not burn retries (or backoffs) on something waiting cannot fix.
+        if (GetTabIndex(tabName) < 0)
+        {
+            LastFailure = $"Restock tab '{tabName}' not found in the stash -- check the tab name setting.";
+            _log($"[Stash] {LastFailure}");
+            return PullResult.ConfigError;
+        }
+
+        if (!await SwitchToTabByName(tabName, ct))
+        {
+            LastFailure = $"Could not switch to tab '{tabName}'.";
+            return PullResult.Failed;
+        }
 
         for (var attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
         {
@@ -207,11 +257,15 @@ public sealed class StashService
             var counterBefore = InventoryCounter;
             await _input.CtrlClickRect(item.GetClientRect(), ct);
             if (await WaitForInventoryChange(counterBefore, 2000, ct))
+            {
+                LastFailure = null;
                 return PullResult.Pulled;
+            }
 
             _log("[Stash] Ctrl-click did not move the item -- retrying.");
         }
 
+        LastFailure = $"Ctrl-clicking the item out of tab '{tabName}' never moved it.";
         return PullResult.Failed;
     }
 
@@ -355,6 +409,21 @@ public sealed class StashService
         return Stash?.IndexVisibleStash == tabIndex;
     }
 
+    /// <summary>
+    /// Clear whatever panel would swallow the stash click (the Simulacrum
+    /// wave-reward/modifier popup is the usual culprit). Escape is only pressed
+    /// while a blocking panel is actually open — with nothing to close it brings
+    /// up the game menu, which would then swallow the click itself.
+    /// </summary>
+    private async SyncTask<bool> CloseBlockingPanel(CancellationToken ct)
+    {
+        if (IsStashPanelOpen || !_gameState.HasBlockingUiPanel) return false;
+        _log("[Stash] A panel is in the way -- pressing Escape to close it.");
+        await _input.PressKey(Keys.Escape, ct);
+        await Task.Delay(300, ct);
+        return true;
+    }
+
     public async SyncTask<bool> OpenStashPanel(CancellationToken ct)
     {
         // Right after an area transition (chores start the moment we land back in
@@ -363,7 +432,8 @@ public sealed class StashService
         if (!IsStashPanelOpen && _gameState.FindStash() == null &&
             !await Helpers.WaitHelpers.For(() => _gameState.FindStash() != null, 5000, ct))
         {
-            _log("[Stash] No stash entity found in this area.");
+            LastFailure = "No stash entity found in this area.";
+            _log($"[Stash] {LastFailure}");
             return false;
         }
 
@@ -371,10 +441,15 @@ public sealed class StashService
         {
             if (IsStashPanelOpen) return true;
 
+            // A blocking panel (wave reward, game menu, ...) swallows entity
+            // clicks — close it before spending an attempt.
+            await CloseBlockingPanel(ct);
+
             var stash = _gameState.FindStash();
             if (stash == null)
             {
-                _log("[Stash] No stash entity found in this area.");
+                LastFailure = "No stash entity found in this area.";
+                _log($"[Stash] {LastFailure}");
                 return false;
             }
 
@@ -411,6 +486,7 @@ public sealed class StashService
                 if (ct.IsCancellationRequested) break;
                 if (IsStashPanelOpen) return true;
 
+                await CloseBlockingPanel(ct);
                 _log("[Stash] Stash won't highlight -- approaching from another side...");
                 await _navigation.MoveToTarget(target.GridPosNum + offset, ct, 6);
                 await _navigation.ClickEntity(target, ct);
@@ -419,6 +495,7 @@ public sealed class StashService
             }
         }
 
+        LastFailure = "The stash panel did not open after 3 direct clicks and 4 approach angles.";
         _log("[Stash] Failed to open stash panel.");
         return false;
     }

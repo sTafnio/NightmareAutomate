@@ -136,8 +136,18 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     private bool _sawServerMonstersThisWave;
     private DateTime _lootDivertAt = DateTime.MinValue;
     private readonly Dictionary<uint, DateTime> _daemonSkipUntil = [];
+    private readonly Dictionary<uint, int> _daemonFailCounts = [];
     private readonly Dictionary<uint, int> _engageStalls = [];
     private readonly Dictionary<uint, DateTime> _targetSkipUntil = [];
+
+    /// <summary>Hunting this long without seeing a monster or the server counter
+    /// dropping triggers the shake-off relocation.</summary>
+    private const int HuntFrustrationSeconds = 40;
+
+    private DateTime _huntingSince = DateTime.MinValue;
+    private int _huntLastRemaining;
+    private int _huntShakeoffs;
+    private static readonly Random HuntRandom = new();
 
     public SimulacrumStrategy(
         NavigationService navigation,
@@ -191,14 +201,36 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         _monstersCachedAt = DateTime.MinValue;
         _lootService.ForgetAll();
         _daemonSkipUntil.Clear();
+        _daemonFailCounts.Clear();
         _engageStalls.Clear();
         _targetSkipUntil.Clear();
         _temporalAuraCache.Clear();
+        _huntingSince = DateTime.MinValue;
+        _huntLastRemaining = 0;
+        _huntShakeoffs = 0;
     }
 
     public async SyncTask<bool> ExecuteFarm(RunContext run, CancellationToken ct)
     {
         UpdatePortalKnowledge(run);
+
+        // Hard per-run time limit: some rare mod rolls are effectively unkillable
+        // for the build and would pin the bot in one wave for hours. Past the
+        // limit the run is not fought any further — skip straight to Finishing,
+        // which walks out and reports the run as complete; the engine then
+        // opens the next Simulacrum as usual.
+        var abandonAfter = _settings.AbandonRunAfterMinutes;
+        if (abandonAfter > 0 && !run.AbandonedByTimer &&
+            _phase is not (SimPhase.Finishing or SimPhase.Completed) &&
+            run.RunStartedAt != default &&
+            (DateTime.Now - run.RunStartedAt).TotalMinutes >= abandonAfter)
+        {
+            run.AbandonedByTimer = true;
+            _log($"[Simulacrum] Run has been going for over {abandonAfter} minutes " +
+                 $"(wave {run.WavesStarted}/{TotalWaves}) -- abandoning it and moving on.");
+            await _navigation.ReleaseMoveKey();
+            _phase = SimPhase.Finishing;
+        }
 
         // Remember every ground item we pass (mid-wave drops etc.) so the
         // post-wave loot phase can collect them even after they leave the bubble.
@@ -581,6 +613,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (monsters.Count > 0)
         {
             _lastMonsterSeenAt = DateTime.Now;
+            // Contact = the hunt worked; disarm the frustration guard.
+            _huntingSince = DateTime.MinValue;
+            _huntShakeoffs = 0;
 
             var target = PickTarget(monsters);
             if (target == null)
@@ -636,10 +671,19 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             return SimPhase.StartingWave;
         }
 
+        // Hunt-frustration guard: the branches below always re-pick the NEAREST
+        // daemon/last-known spot, so a corner wedge re-walks the same doomed route
+        // every tick forever. When the hunt has made no progress for a while,
+        // relocate somewhere genuinely different first — that un-wedges the
+        // character AND shifts the network bubble so other entities stream in.
+        if (_gameState.MonstersRemaining > 0 && await ShakeOffIfHuntStuck(ct))
+            return SimPhase.Fighting;
+
         // Prefer chasing the spawner daemons — walking near one activates its pack
         // (unspawned packs have no monster entities yet, only these daemons).
-        // Daemons that couldn't be reached are skipped for a while. The walk aborts
-        // as soon as monsters appear.
+        // Daemons that couldn't be reached are skipped with an escalating backoff
+        // (a genuinely unreachable one must stop dominating the nearest-first
+        // pick). The walk aborts as soon as monsters appear.
         var daemon = FindNearestSpawnerDaemon();
         if (daemon != null)
         {
@@ -647,8 +691,11 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                 stopWhen: StopWhenMonstersNearby());
             if (!reached && daemon.IsValid && GetNearbyMonsters().Count == 0)
             {
-                _daemonSkipUntil[daemon.Id] = DateTime.Now.AddSeconds(10);
-                _log("[Simulacrum] Spawn point unreachable, skipping it for a bit.");
+                var fails = _daemonFailCounts.GetValueOrDefault(daemon.Id) + 1;
+                _daemonFailCounts[daemon.Id] = fails;
+                var skipSeconds = fails switch { 1 => 10, 2 => 30, _ => 60 };
+                _daemonSkipUntil[daemon.Id] = DateTime.Now.AddSeconds(skipSeconds);
+                _log($"[Simulacrum] Spawn point unreachable ({fails}x) -- skipping it for {skipSeconds}s.");
             }
             return SimPhase.Fighting;
         }
@@ -732,6 +779,77 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// Hunt watchdog. Hunting = wave alive, nothing targetable near us. The clock
+    /// (re)arms on progress — first hunt tick, monster contact (reset in
+    /// DoFighting), or the server counter dropping. Past the threshold: first
+    /// strike walks to a RANDOM far tour point (ignoring the daemon/last-known
+    /// hints that keep leading into the same corner), second strike walks a full
+    /// exploration lap. Returns true when a shake-off walk ran this tick.
+    /// </summary>
+    private async SyncTask<bool> ShakeOffIfHuntStuck(CancellationToken ct)
+    {
+        var remaining = _gameState.MonstersRemaining;
+
+        if (_huntingSince == DateTime.MinValue)
+        {
+            // Hunt just started — arm the clock, no shake-off yet.
+            _huntingSince = DateTime.Now;
+            _huntLastRemaining = remaining;
+            return false;
+        }
+
+        if (remaining < _huntLastRemaining)
+        {
+            // Something died (ReAgent off-screen kill, volatile, ...) — progress.
+            _huntingSince = DateTime.Now;
+            _huntLastRemaining = remaining;
+            _huntShakeoffs = 0;
+            return false;
+        }
+
+        // More spawns registering is not hunt progress, but track the high-water
+        // mark so a later kill still reads as a decrease.
+        if (remaining > _huntLastRemaining)
+            _huntLastRemaining = remaining;
+
+        if (SecondsSince(_huntingSince) < HuntFrustrationSeconds)
+            return false;
+
+        _huntShakeoffs++;
+        _huntingSince = DateTime.Now; // fresh window after the shake-off
+
+        // Abort the relocation the moment monsters appear or the wave truly ends.
+        var stop = WaitHelpers.Throttle(
+            () => GetNearbyMonsters().Count > 0 || _gameState.MonstersRemaining == 0, 250);
+
+        var tour = _exploration.GetTour();
+        if (_huntShakeoffs == 1 && tour is { Count: > 0 })
+        {
+            var playerPos = _gameState.PlayerGridPos;
+            var farPoints = tour.Where(p => Vector2.Distance(playerPos, p) > 60).ToList();
+            var pick = farPoints.Count > 0
+                ? farPoints[HuntRandom.Next(farPoints.Count)]
+                : tour[HuntRandom.Next(tour.Count)];
+            _log("[Simulacrum] Hunt is stuck -- relocating to a random spot to reset.");
+            await _navigation.MoveToTarget(pick, ct, 20, stopWhen: stop);
+            return true;
+        }
+
+        // Second strike (or no tour available): walk at most one full lap.
+        // Bounded — a monster in an unreachable pocket must not trap the phase
+        // machine inside an endless ExploreUntil.
+        _log("[Simulacrum] Hunt is still stuck -- walking a full exploration lap.");
+        var legs = Math.Max(8, tour?.Count ?? 8);
+        for (var i = 0; i < legs && !ct.IsCancellationRequested && !stop(); i++)
+        {
+            if (!_gameState.IsConnected) break;
+            await _exploration.WalkTourLeg(stop, ct);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -937,7 +1055,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             }
         }
 
-        var ok = await _stashService.Execute(ct);
+        var ok = await _stashService.Execute(ct) == StashResult.Ok;
 
         if (!ok && !_warnedInventoryFull)
         {

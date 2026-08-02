@@ -228,6 +228,15 @@ public class SettingsDrawer
         _s.PathLookahead = Slider("Path Lookahead", _s.PathLookahead, 1, 50,
             "How many path nodes ahead to target for movement.");
 
+        ImGui.SeparatorText("Recovery");
+
+        _s.MaxReconnectAttempts = Slider("Max Relogin Attempts", _s.MaxReconnectAttempts, 0, 1000,
+            "After a disconnect, how many Enter presses to attempt before giving up and stopping " +
+            "the session. The cadence backs off (5s for 2 min, then 15s, then 30s), so the default " +
+            "of 150 gives up after roughly an hour. Waiting for window focus or on loading screens " +
+            "does not count. 0 = keep trying forever.",
+            _s.MaxReconnectAttempts == 0 ? "forever" : "%d");
+
         ImGui.SeparatorText("Targeting & Combat");
 
         _s.HoverRange = Slider("Hover Range", _s.HoverRange, 10, 100,
@@ -256,6 +265,11 @@ public class SettingsDrawer
         _s.LateLootLingerSeconds = Slider("Late Loot Linger (s)", _s.LateLootLingerSeconds, 0, 15,
             "After a wave's loot is fully picked, keep watching the ground this long for " +
             "late-spawning items (the game sometimes spawns a single item well after the rest).");
+        _s.AbandonRunAfterMinutes = Slider("Abandon Run After (min)", _s.AbandonRunAfterMinutes, 0, 180,
+            "Hard time limit per run, counted from map device activation (deaths and hideout trips " +
+            "included). Past it the run is abandoned: leave the map, treat the run as completed, " +
+            "open the next Simulacrum. Guards against unkillable rare mod rolls. 0 = no limit.",
+            _s.AbandonRunAfterMinutes == 0 ? "off" : "%d");
 
         ImGui.SeparatorText("Discord Notifications");
 

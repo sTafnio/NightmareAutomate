@@ -114,6 +114,24 @@ public sealed class GameStateService(GameController gc)
         }
     }
 
+    /// <summary>The generic popup window (wave-reward/modifier dialogs) alone —
+    /// the one panel class that can sit ABOVE the map device window and swallow
+    /// its clicks without the device UI itself counting as "blocking".</summary>
+    public bool HasPopupOpen
+    {
+        get
+        {
+            try
+            {
+                return _gc.IngameState?.IngameUi?.PopUpWindow?.IsVisible == true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
     /// <summary>Whether the character is currently moving (Actor component).</summary>
     public bool IsPlayerMoving => _gc.Player?.GetComponent<Actor>()?.isMoving == true;
 

@@ -30,6 +30,11 @@ public sealed class NavigationService
     /// keeps rendering the last snapshot with InGame still true.</summary>
     private const int StallAbortMs = 4000;
 
+    /// <summary>How far (grid units) the corner-unstick sidestep tries to move.</summary>
+    private const float SidestepDistance = 18f;
+
+    private static readonly Random SidestepRandom = new();
+
     private readonly GameStateService _gameState;
     private readonly GridPathfinder _pathfinding;
     private readonly InputService _input;
@@ -115,6 +120,7 @@ public sealed class NavigationService
             // fires once PoE finally drops the frozen session and flips InGame).
             var lastProgressPos = _gameState.PlayerGridPos;
             var lastProgressAt = DateTime.Now;
+            var sidestepTried = false;
 
             try
             {
@@ -176,10 +182,32 @@ public sealed class NavigationService
                     }
                     else if (steered && (DateTime.Now - lastProgressAt).TotalMilliseconds > StallAbortMs)
                     {
-                        LogThrottled("nav-stall",
-                            "No movement progress -- abandoning the walk (stuck or frozen/disconnected).");
-                        cts.Cancel();
-                        break;
+                        // One sidestep before giving up: a short walk in a random
+                        // walkable direction un-wedges corner geometry (the classic
+                        // stuck case). Ground gained resets the watchdog and the
+                        // route recomputes from the new spot; no ground gained
+                        // (hard wedge or frozen client) abandons as before.
+                        var unstuck = false;
+                        if (!sidestepTried)
+                        {
+                            sidestepTried = true;
+                            LogThrottled("nav-sidestep",
+                                "No movement progress -- sidestepping to get unstuck.");
+                            unstuck = await TrySidestep(ct);
+                        }
+
+                        if (unstuck)
+                        {
+                            lastProgressPos = _gameState.PlayerGridPos;
+                            lastProgressAt = DateTime.Now;
+                        }
+                        else
+                        {
+                            LogThrottled("nav-stall",
+                                "No movement progress -- abandoning the walk (stuck or frozen/disconnected).");
+                            cts.Cancel();
+                            break;
+                        }
                     }
 
                     // Unconditional yield: without a path (field still building or no
@@ -212,6 +240,59 @@ public sealed class NavigationService
             _log($"Error in NavigationService: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Corner-unstick maneuver: steer ~18 units toward a random walkable direction
+    /// for up to ~1.2s. Probes 8 directions (midpoint + endpoint against the
+    /// walkability grid) starting from a random angle. True = real ground was
+    /// gained; false = hard-wedged or a frozen client, and the caller should
+    /// abandon the walk as before.
+    /// </summary>
+    private async SyncTask<bool> TrySidestep(CancellationToken ct)
+    {
+        int[][]? terrain;
+        try
+        {
+            terrain = _gameState.Controller.IngameState?.Data?.RawPathfindingData;
+        }
+        catch
+        {
+            terrain = null;
+        }
+
+        var start = _gameState.PlayerGridPos;
+        var rows = terrain?.Length ?? 0;
+
+        var baseAngle = SidestepRandom.NextDouble() * Math.PI * 2;
+        Vector2? dest = null;
+        for (var i = 0; i < 8; i++)
+        {
+            var angle = baseAngle + i * (Math.PI / 4);
+            var dir = new Vector2((float)Math.Cos(angle), (float)Math.Sin(angle));
+            var mid = start + dir * (SidestepDistance / 2);
+            var end = start + dir * SidestepDistance;
+            if (terrain == null ||
+                (TerrainGrid.IsWalkable(terrain, rows, (int)mid.X, (int)mid.Y) &&
+                 TerrainGrid.IsWalkable(terrain, rows, (int)end.X, (int)end.Y)))
+            {
+                dest = end;
+                break;
+            }
+        }
+
+        if (dest == null) return false;
+
+        var deadline = DateTime.Now.AddMilliseconds(1200);
+        while (DateTime.Now < deadline && !ct.IsCancellationRequested)
+        {
+            if (Vector2.Distance(_gameState.PlayerGridPos, start) > SidestepDistance * 0.6f)
+                return true;
+            await SteerTowards(dest.Value, ct, logNode: "sidestep");
+            await TaskUtils.NextFrame();
+        }
+
+        return Vector2.Distance(_gameState.PlayerGridPos, start) > 5;
     }
 
     /// <summary>
