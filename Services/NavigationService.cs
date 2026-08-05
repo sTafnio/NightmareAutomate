@@ -39,6 +39,7 @@ public sealed class NavigationService
     private readonly GridPathfinder _pathfinding;
     private readonly InputService _input;
     private readonly Action<string> _log;
+    private readonly Action<string> _chatter;
     private readonly Func<int> _getLookahead;
     private readonly Func<Keys> _getMoveKey;
 
@@ -59,11 +60,15 @@ public sealed class NavigationService
         _log(message);
     }
 
+    /// <param name="log">Important events — goes to the overlay AND the file log.</param>
+    /// <param name="chatter">Per-second steering noise ("Moving towards ...") —
+    /// overlay only, so an overnight session does not flood the file log.</param>
     public NavigationService(
         GameStateService gameState,
         GridPathfinder pathfinding,
         InputService input,
         Action<string> log,
+        Action<string> chatter,
         Func<int> getLookahead,
         Func<Keys> getMoveKey)
     {
@@ -71,6 +76,7 @@ public sealed class NavigationService
         _pathfinding = pathfinding;
         _input = input;
         _log = log;
+        _chatter = chatter;
         _getLookahead = getLookahead;
         _getMoveKey = getMoveKey;
     }
@@ -330,7 +336,7 @@ public sealed class NavigationService
 
         if (logNode != null && (DateTime.Now - _lastLogTime).TotalMilliseconds > 1000)
         {
-            _log($"Moving towards {logNode}");
+            _chatter($"Moving towards {logNode}");
             _lastLogTime = DateTime.Now;
         }
 
@@ -390,30 +396,35 @@ public sealed class NavigationService
             }
         }
 
-        var clickPos = new Vector2(screenCoord.X + rect.Left, screenCoord.Y + rect.Top);
-
-        await _input.MoveMouse(clickPos, ct);
-
-        // Give the game a moment to highlight the entity under the cursor.
-        var targeted = await WaitHelpers.For(
-            () => target.GetComponent<Targetable>()?.isTargeted == true, 800, ct);
-
-        if (!targeted)
+        // Hover attempts: exact interact center first (with one fresh
+        // re-projection — the camera can settle after the standstill wait),
+        // then small jittered offsets around it. Something else can sit exactly
+        // on the center and steal the highlight there (a minion, another
+        // entity's label, a doodad) while a nearby point of the model is free.
+        var targeted = false;
+        for (var attempt = 0; attempt < 4 && !targeted && !ct.IsCancellationRequested; attempt++)
         {
-            // One re-hover with a fresh projection — the first one can land off
-            // when the entity/camera settled after the standstill wait.
             screenCoord = _gameState.WorldToScreen(center);
-            await _input.MoveMouse(
-                new Vector2(screenCoord.X + rect.Left, screenCoord.Y + rect.Top), ct);
+            var hoverPos = new Vector2(screenCoord.X + rect.Left, screenCoord.Y + rect.Top);
+            if (attempt >= 2)
+                hoverPos += new Vector2(
+                    (float)(SidestepRandom.NextDouble() * 2 - 1) * 20f,
+                    (float)(SidestepRandom.NextDouble() * 2 - 1) * 20f);
+
+            await _input.MoveMouse(hoverPos, ct);
             targeted = await WaitHelpers.For(
-                () => target.GetComponent<Targetable>()?.isTargeted == true, 400, ct);
+                () => target.GetComponent<Targetable>()?.isTargeted == true,
+                attempt == 0 ? 800 : 400, ct);
         }
 
         if (!targeted)
         {
             // A blind click would hit whatever is actually under the cursor —
-            // skip it so the caller's verify+retry re-evaluates with fresh state.
-            _log($"Entity never highlighted under cursor -- not clicking ({target.Path}).");
+            // skip it so the caller's verify+retry re-evaluates with fresh
+            // state. Log what IS under the cursor: when this fails repeatedly,
+            // the thief's identity is the whole diagnosis.
+            _log($"Entity never highlighted under cursor -- not clicking ({target.Path}). " +
+                 _gameState.DescribeHoverTarget());
             return false;
         }
 

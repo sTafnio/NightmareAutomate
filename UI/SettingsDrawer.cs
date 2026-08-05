@@ -228,6 +228,14 @@ public class SettingsDrawer
         _s.PathLookahead = Slider("Path Lookahead", _s.PathLookahead, 1, 50,
             "How many path nodes ahead to target for movement.");
 
+        ImGui.SeparatorText("Debug");
+
+        if (ImGui.Button("Dump Atlas UI (to log)"))
+            _s.DumpAtlasUi?.Invoke();
+        HelpMarker("Writes the visible Atlas UI tree (element paths, rects, textures, bound " +
+                   "items) to Logs\\Info*.log. Open the Atlas in the state you want captured " +
+                   "first -- e.g. with the map storage COLLAPSED to identify its toggle.");
+
         ImGui.SeparatorText("Recovery");
 
         _s.MaxReconnectAttempts = Slider("Max Relogin Attempts", _s.MaxReconnectAttempts, 0, 1000,

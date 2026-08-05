@@ -114,6 +114,14 @@ public class NightmareAutomateSettings : ISettings
     [JsonIgnore]
     public Action? SendTestNotification { get; set; }
 
+    // --- Debug ---
+
+    /// <summary>Log the visible Atlas UI tree (rects, textures, entity bindings)
+    /// to the file log — for identifying moved/unknown elements like the storage
+    /// collapse toggle. Wired up by the plugin in Initialise.</summary>
+    [JsonIgnore]
+    public Action? DumpAtlasUi { get; set; }
+
     // --- Loot & Stash ---
 
     [IgnoreMenu]

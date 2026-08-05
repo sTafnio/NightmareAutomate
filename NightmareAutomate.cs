@@ -40,6 +40,19 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     // UI
     private DebugOverlay _overlay = null!;
 
+    /// <summary>
+    /// Standard log channel for every important step: the on-screen overlay AND
+    /// ExileCore's file log (Logs\Info*.log via BasePlugin.LogMessage) — so a
+    /// failed overnight session leaves a full trail instead of 4 overlay lines.
+    /// Per-frame/per-second chatter (movement steering) must NOT go through
+    /// this — pass the overlay directly for those.
+    /// </summary>
+    private void LogInfo(string msg)
+    {
+        _overlay.Log(msg);
+        LogMessage($"[NightmareAutomate] {msg}");
+    }
+
     public override bool Initialise()
     {
         Name = "Nightmare Automate";
@@ -62,7 +75,8 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             _gameState,
             _pathfinding,
             _input,
-            msg => _overlay.Log(msg),
+            LogInfo,
+            msg => _overlay.Log(msg), // steering chatter: overlay only, never the file
             () => Settings.PathLookahead,
             () => Settings.MoveKey.Value.Key);
 
@@ -71,10 +85,10 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             _inventory,
             _navigation,
             _input,
-            msg => _overlay.Log(msg),
+            LogInfo,
             () => Settings.ToggleLabelsKey.Value.Key);
 
-        _exploration = new ExplorationService(_gameState, _navigation, msg => _overlay.Log(msg));
+        _exploration = new ExplorationService(_gameState, _navigation, LogInfo);
 
         _mapDevice = new MapDeviceService(
             _gameState,
@@ -82,7 +96,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             _navigation,
             _input,
             _exploration,
-            msg => _overlay.Log(msg),
+            LogInfo,
             () => Settings.InventoryKey.Value.Key);
 
         _stashService = new StashService(
@@ -90,32 +104,33 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
             _inventory,
             _navigation,
             _input,
-            msg => _overlay.Log(msg),
+            LogInfo,
             () => Settings.DumpTabNames);
 
         // Must exist BEFORE EventRecovery below -- the constructor captures the
         // field VALUE, so a later assignment would leave recovery with null.
-        _webhook = new DiscordWebhookService(Settings, msg => _overlay.Log(msg));
+        _webhook = new DiscordWebhookService(Settings, LogInfo);
         Settings.SendTestNotification = () => _webhook.SendTest();
+        Settings.DumpAtlasUi = () => _mapDevice.DumpAtlasUiTree("manual dump from settings");
 
         _recovery = new EventRecovery(
             _gameState,
             _input,
             _webhook,
-            msg => _overlay.Log(msg),
+            LogInfo,
             () => Settings.HideoutKey.Value.Key,
             () => Settings.MaxReconnectAttempts);
 
         _stats = new Models.SessionStats();
 
-        _gems = new GemLevelService(_gameState, _input, _stats, msg => _overlay.Log(msg));
+        _gems = new GemLevelService(_gameState, _input, _stats, LogInfo);
 
         _chores = new ChoresService(
             _stashService,
             _gems,
             _inventory,
             Settings,
-            msg => _overlay.Log(msg));
+            LogInfo);
 
         // The dump-tab picker in the settings UI needs live stash tab names.
         Settings.StashTabNames = () => _gameState.GetStashTabNames();
@@ -210,7 +225,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
 
     private void Start()
     {
-        _overlay.Log("Attempting to start bot...");
+        LogInfo("Attempting to start bot...");
         try
         {
             var strategy = CreateStrategy();
@@ -232,13 +247,13 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
                 _webhook,
                 _stats,
                 _exploration,
-                _overlay.Log,
+                LogInfo,
                 () => Settings.MaxRuns);
 
             _cts = new CancellationTokenSource();
             _currentTask = _engine.Run(_cts.Token);
 
-            _overlay.Log($"Bot engine started: {strategy.Name}");
+            LogInfo($"Bot engine started: {strategy.Name}");
         }
         catch (Exception ex)
         {
@@ -257,7 +272,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     {
         if (_cts is not { IsCancellationRequested: false }) return;
 
-        _overlay.Log("Stop requested -- unwinding...");
+        LogInfo("Stop requested -- unwinding...");
         _cts.Cancel();
     }
 
@@ -271,7 +286,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
 
         // Safety net: the cooperative unwind should have released these already.
         ForceReleaseHeldKeys();
-        _overlay.Log("Bot stopped.");
+        LogInfo("Bot stopped.");
     }
 
     /// <summary>
@@ -291,7 +306,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
         {
             FarmType.Simulacrum => new SimulacrumStrategy(
                 _navigation, _gameState, _lootService, _inventory, _stashService,
-                _exploration, _input, _gems, Settings, _overlay.Log),
+                _exploration, _input, _gems, Settings, LogInfo),
 
             _ => null
         };

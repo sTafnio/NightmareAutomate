@@ -138,6 +138,25 @@ public sealed class GameStateService(GameController gc)
         }
     }
 
+    /// <summary>Whether the Atlas panel (which embeds the map device UI) is open.
+    /// The Atlas and other panels (stash, ...) are mutually exclusive — opening
+    /// one closes the other — so a flow that needs ITS panel while the Atlas is
+    /// up must Escape the Atlas first and then REOPEN its own panel.</summary>
+    public bool IsAtlasOpen
+    {
+        get
+        {
+            try
+            {
+                return _gc.IngameState?.IngameUi?.Atlas?.IsVisible == true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
     /// <summary>The generic popup window (wave-reward/modifier dialogs) alone —
     /// the one panel class that can sit ABOVE the map device window and swallow
     /// its clicks without the device UI itself counting as "blocking".</summary>
@@ -153,6 +172,52 @@ public sealed class GameStateService(GameController gc)
             {
                 return false;
             }
+        }
+    }
+
+    /// <summary>
+    /// One-line diagnosis of what the cursor is ACTUALLY on: the world entity
+    /// holding the hover highlight (if any) and whether a UI element sits under
+    /// the cursor. Used when an intended click target never highlights — the
+    /// identity of the thief (a minion, an NPC, a panel edge) is the diagnosis.
+    /// Walks the entity list with per-entity guards; only called on failure paths.
+    /// </summary>
+    public string DescribeHoverTarget()
+    {
+        try
+        {
+            var playerPos = PlayerGridPos;
+            Entity? highlighted = null;
+            foreach (var e in _gc.EntityListWrapper.Entities)
+            {
+                try
+                {
+                    if (e?.GetComponent<Targetable>()?.isTargeted == true)
+                    {
+                        highlighted = e;
+                        break;
+                    }
+                }
+                catch
+                {
+                    // Entity mid-update -- skip it.
+                }
+            }
+
+            var s = highlighted != null
+                ? $"[hover: highlight is on '{highlighted.Path}' " +
+                  $"({(int)System.Numerics.Vector2.Distance(playerPos, highlighted.GridPosNum)} units from player)"
+                : "[hover: no world entity is highlighted";
+
+            var uiHover = _gc.IngameState?.UIHoverElement;
+            if (uiHover != null && uiHover.Address != 0 && uiHover.IsVisible)
+                s += $"; a UI element is under the cursor ({uiHover.GetType().Name})";
+
+            return s + "]";
+        }
+        catch (Exception ex)
+        {
+            return $"[hover state unreadable: {ex.Message}]";
         }
     }
 

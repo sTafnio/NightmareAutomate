@@ -309,8 +309,48 @@ public sealed class FarmingEngine
         return BotState.Idle;
     }
 
+    /// <summary>
+    /// Reality check for the hideout-side states: a portal entry whose area
+    /// transition was never confirmed (loading screen outlasted the check, stale
+    /// host) leaves the engine cycling InHideout/WaitingForPortal while the
+    /// player already stands INSIDE the farm area -- and neither state looks at
+    /// the actual area, so nothing would ever correct it (only Idle re-detects).
+    /// When that happens, count the consumed portal and hand control to the
+    /// strategy, mirroring the confirmed-entry path in DoEnteringMap.
+    /// </summary>
+    private bool AdoptUnconfirmedMapEntry()
+    {
+        if (!_gameState.IsReady || !_strategy.IsFarmArea(_gameState.AreaName))
+            return false;
+
+        if (!Context.RunActive)
+        {
+            Context.ResetForNewRun();
+            Context.RunActive = true;
+            BeginRunTracking();
+        }
+
+        // The entry consumed a portal even though its transition was missed.
+        Context.PortalsUsed++;
+        var firstEntry = Context.PortalsUsed == 1;
+        // We entered moments ago and have not walked anywhere on our own -- the
+        // current position is the return-portal spot (kept from the first entry
+        // on re-entries: same instance, same portals).
+        Context.MapEntryPoint ??= _gameState.PlayerGridPos;
+        _log($"Already inside '{_gameState.AreaName}' -- adopting the unconfirmed entry " +
+             $"(portal {Context.PortalsUsed}/{RunContext.MaxPortals}).");
+        if (firstEntry)
+            _strategy.Reset();
+        return true;
+    }
+
     private BotState DoInHideout()
     {
+        // Standing inside the farm area means an entry went unconfirmed -- no
+        // hideout logic applies; hand the run to the strategy.
+        if (AdoptUnconfirmedMapEntry())
+            return BotState.RunningFarm;
+
         // Farm portals already up (e.g. manually activated, or bot restarted mid-run):
         // adopt them instead of consuming a fresh fragment. Used count is inferred
         // from how many of the 6 portals remain. Skipped when they belong to a run
@@ -570,12 +610,27 @@ public sealed class FarmingEngine
                 {
                     _mapDeviceTroubleNotified = true;
                     _webhook.NotifyCritical("Map device trouble",
-                        $"Opening a map has failed 3x in a row ({detail}) -- resetting the UI and retrying; " +
-                        $"will stop after {MaxMapDeviceFailures} failures.");
+                        $"Opening a map has failed 3x in a row ({detail}) -- hard-resetting " +
+                        $"(UI + area refresh + fresh approach) and retrying; " +
+                        $"will stop after {MaxMapDeviceFailures} failures. Details are in Logs\\Info*.log.");
                 }
 
-                _log($"Map device flow failed ({detail}) -- resetting the UI and retrying shortly.");
-                await _mapDevice.ResetUi(ct);
+                // First failure: quick UI reset. From the second on, restart
+                // everything the flow depends on (UI + host area refresh + a
+                // fresh approach walk) — repeated failures with a fine-looking
+                // hideout are usually the server not sending an update or the
+                // host reading stale state, which no UI reset can fix.
+                if (_mapDeviceFailuresInARow >= 2)
+                {
+                    _log($"Map device flow failed ({detail}) -- hard reset (UI + area refresh + fresh approach), then retrying.");
+                    await _mapDevice.HardReset(ct);
+                }
+                else
+                {
+                    _log($"Map device flow failed ({detail}) -- resetting the UI and retrying shortly.");
+                    await _mapDevice.ResetUi(ct);
+                }
+
                 await Task.Delay(_mapDeviceFailuresInARow >= 3 ? 10000 : 2000, ct);
                 return BotState.InHideout;
             }
@@ -584,6 +639,12 @@ public sealed class FarmingEngine
 
     private async SyncTask<BotState> DoWaitingForPortal(CancellationToken ct)
     {
+        // Inside the farm area there are no hideout-side farm portals to find --
+        // an unconfirmed entry would otherwise ping-pong this state with
+        // InHideout forever.
+        if (AdoptUnconfirmedMapEntry())
+            return BotState.RunningFarm;
+
         var portals = _gameState.FindFarmPortals(_strategy.IsFarmArea);
         if (portals.Count > 0)
             return BotState.EnteringMap;
@@ -758,16 +819,28 @@ public sealed class FarmingEngine
 
     /// <summary>
     /// Frame-checked wait for a post-click area transition: skips loading frames
-    /// and returns true as soon as the arrival condition holds.
+    /// and returns true as soon as the arrival condition holds. Loading screens
+    /// do not consume the confirmation window -- a Simulacrum load alone can
+    /// outlast it, and an expired wait here mis-reports a transition that DID
+    /// happen (the engine then waits for portals while standing inside the map).
+    /// A hard cap still bounds the whole wait so a stuck loading flag cannot
+    /// hang the handler forever.
     /// </summary>
     private async SyncTask<bool> WaitForAreaTransition(
         Func<bool> arrived, int timeoutSeconds, CancellationToken ct)
     {
         var deadline = DateTime.Now.AddSeconds(timeoutSeconds);
+        var hardCap = DateTime.Now.AddMinutes(2);
         while (DateTime.Now < deadline && !ct.IsCancellationRequested)
         {
             await TaskUtils.NextFrame();
-            if (_gameState.IsLoading) continue;
+            if (_gameState.IsLoading)
+            {
+                if (DateTime.Now < hardCap)
+                    deadline = DateTime.Now.AddSeconds(timeoutSeconds);
+                continue;
+            }
+
             if (arrived()) return true;
         }
 

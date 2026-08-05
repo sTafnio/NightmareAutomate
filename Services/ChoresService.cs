@@ -100,12 +100,14 @@ public sealed class ChoresService
         (DateTime.Now - _gemAttemptAt).TotalSeconds > 30 &&
         _gems.HasReadyGems();
 
-    /// <summary>A fragment path with no stock anywhere we control: map slot, device
-    /// storage, player inventory. (The device storage reads 0 while never opened
-    /// this session — a spurious restock then is harmless: the inventory count
-    /// stops it from repeating.)</summary>
+    /// <summary>A fragment path with no SPARE in device storage or player
+    /// inventory. The map slot deliberately does NOT count: a fragment armed in
+    /// the slot cannot reopen a closed device window (that needs right-clicking
+    /// a spare), so "slot loaded, nothing else" must still trigger a restock —
+    /// the spare gets parked in the device storage and serves the next run.
+    /// (The device storage reads 0 while never opened this session — a spurious
+    /// restock then is harmless: the inventory count stops it from repeating.)</summary>
     private bool FragmentMissing(string path) =>
-        _inventory.CountItems(_inventory.MapDeviceMapInventory, path) == 0 &&
         _inventory.CountItems(_inventory.MapDeviceStorage, path) == 0 &&
         _inventory.CountItems(_inventory.MainInventory, path) == 0;
 

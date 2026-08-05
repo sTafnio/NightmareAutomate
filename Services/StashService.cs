@@ -240,6 +240,16 @@ public sealed class StashService
 
         for (var attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
         {
+            // The panel closing mid-session must NOT read as "tab empty": an
+            // Empty verdict means "out of fragments" to the caller and would
+            // end the whole farming session on a UI hiccup.
+            if (!IsStashInteractable)
+            {
+                LastFailure = "The stash panel closed (or got covered) mid-restock.";
+                _log($"[Stash] {LastFailure}");
+                return PullResult.Failed;
+            }
+
             var item = FindVisibleTabItem(itemPathFragment);
             if (item == null)
             {
@@ -263,6 +273,14 @@ public sealed class StashService
             }
 
             _log("[Stash] Ctrl-click did not move the item -- retrying.");
+            // Clear anything that may have opened over the stash, and rule out
+            // stale host reads (wrong item rects) before the retry.
+            await CloseBlockingPanel(ct);
+            if (attempt >= 1 && _gameState.TryForceRefreshArea())
+            {
+                _log("[Stash] Forced an area refresh to rule out stale reads.");
+                await Task.Delay(1000, ct);
+            }
         }
 
         LastFailure = $"Ctrl-clicking the item out of tab '{tabName}' never moved it.";
@@ -409,14 +427,33 @@ public sealed class StashService
         return Stash?.IndexVisibleStash == tabIndex;
     }
 
+    /// <summary>Whether stash items can actually be clicked. Atlas and stash are
+    /// mutually exclusive panels, so with the Atlas up the stash cannot be open —
+    /// the extra check only guards transition frames where both could briefly
+    /// read visible.</summary>
+    private bool IsStashInteractable => IsStashPanelOpen && !_gameState.IsAtlasOpen;
+
     /// <summary>
-    /// Clear whatever panel would swallow the stash click (the Simulacrum
-    /// wave-reward/modifier popup is the usual culprit). Escape is only pressed
-    /// while a blocking panel is actually open — with nothing to close it brings
-    /// up the game menu, which would then swallow the click itself.
+    /// Clear whatever panel would swallow the stash click. The ATLAS is checked
+    /// first (e.g. left open by a failed map-device flow): Escaping it closes
+    /// the whole Atlas UI, after which the stash entity must be clicked to open
+    /// the stash panel fresh — the caller's open loop does that. Beyond that:
+    /// the Simulacrum wave-reward/modifier popup is the usual culprit. Escape is
+    /// only pressed while something is actually open — with nothing to close it
+    /// brings up the game menu, which would then swallow the click itself.
     /// </summary>
     private async SyncTask<bool> CloseBlockingPanel(CancellationToken ct)
     {
+        if (_gameState.IsAtlasOpen)
+        {
+            _log("[Stash] The Atlas is open -- pressing Escape (the stash gets reopened after).");
+            await _input.PressKey(Keys.Escape, ct);
+            // Longer settle than a normal panel close: the whole Atlas UI tears
+            // down and the panel-state reads must not race it.
+            await Task.Delay(500, ct);
+            return true;
+        }
+
         if (IsStashPanelOpen || !_gameState.HasBlockingUiPanel) return false;
         _log("[Stash] A panel is in the way -- pressing Escape to close it.");
         await _input.PressKey(Keys.Escape, ct);
@@ -428,22 +465,35 @@ public sealed class StashService
     {
         // Right after an area transition (chores start the moment we land back in
         // the hideout) the entity list is still streaming — the stash appears a
-        // beat after IsLoading clears. Wait for it instead of failing instantly.
+        // beat after IsLoading clears. Wait for it instead of failing instantly;
+        // if it still is not there, force the host to re-read the area (a missed
+        // area change leaves searches running against a stale world) and give it
+        // one more short wait before giving up.
         if (!IsStashPanelOpen && _gameState.FindStash() == null &&
             !await Helpers.WaitHelpers.For(() => _gameState.FindStash() != null, 5000, ct))
         {
-            LastFailure = "No stash entity found in this area.";
-            _log($"[Stash] {LastFailure}");
-            return false;
+            if (_gameState.TryForceRefreshArea())
+            {
+                _log("[Stash] No stash entity found -- forced an area refresh to rule out a stale host.");
+                await Task.Delay(1000, ct);
+                await Helpers.WaitHelpers.For(() => _gameState.FindStash() != null, 3000, ct);
+            }
+
+            if (_gameState.FindStash() == null)
+            {
+                LastFailure = "No stash entity found in this area.";
+                _log($"[Stash] {LastFailure}");
+                return false;
+            }
         }
 
         for (var attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
         {
-            if (IsStashPanelOpen) return true;
-
-            // A blocking panel (wave reward, game menu, ...) swallows entity
-            // clicks — close it before spending an attempt.
+            // Blocking panels first: the Atlas can sit OVER an already-open
+            // stash panel (both report visible), so "stash open" may only be
+            // trusted after the blockers are gone.
             await CloseBlockingPanel(ct);
+            if (IsStashInteractable) return true;
 
             var stash = _gameState.FindStash();
             if (stash == null)
@@ -462,8 +512,18 @@ public sealed class StashService
 
             // Generous timeout: a direct click from across the screen auto-walks
             // the character first; the wait exits early the moment the panel opens.
-            if (await Helpers.WaitHelpers.For(() => IsStashPanelOpen, 6000, ct))
+            if (await Helpers.WaitHelpers.For(() => IsStashInteractable, 6000, ct))
                 return true;
+        }
+
+        // Three direct attempts down: before the directional fallback, rule out
+        // the host reading stale state (entity positions, panel flags) — the
+        // refresh rebuilds its caches; the fallback then works on fresh data.
+        if (_gameState.TryForceRefreshArea())
+        {
+            _log("[Stash] Direct attempts failed -- forced an area refresh before the fallback.");
+            await Task.Delay(1000, ct);
+            if (IsStashInteractable) return true;
         }
 
         // Directional fallback: from one side the stash can refuse to highlight
@@ -484,13 +544,12 @@ public sealed class StashService
             foreach (var offset in offsets)
             {
                 if (ct.IsCancellationRequested) break;
-                if (IsStashPanelOpen) return true;
-
                 await CloseBlockingPanel(ct);
+                if (IsStashInteractable) return true;
                 _log("[Stash] Stash won't highlight -- approaching from another side...");
                 await _navigation.MoveToTarget(target.GridPosNum + offset, ct, 6);
                 await _navigation.ClickEntity(target, ct);
-                if (await Helpers.WaitHelpers.For(() => IsStashPanelOpen, 4000, ct))
+                if (await Helpers.WaitHelpers.For(() => IsStashInteractable, 4000, ct))
                     return true;
             }
         }
