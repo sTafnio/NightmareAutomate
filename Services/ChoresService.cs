@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using ExileCore.Shared;
+using NightmareAutomate.Helpers;
 
 namespace NightmareAutomate.Services;
 
@@ -30,6 +31,9 @@ public enum ChoresResult
 /// everything that needs the panel — inventory dump, fragment restock — in that
 /// order (dump first frees space; restock last so the pulled fragment is not
 /// dumped right back).
+///
+/// The restock tab name comes from the active strategy (via the engine), not
+/// from a strategy-specific setting read here — this service stays farm-agnostic.
 /// </summary>
 public sealed class ChoresService
 {
@@ -39,7 +43,11 @@ public sealed class ChoresService
     private readonly NightmareAutomateSettings _settings;
     private readonly Action<string> _log;
 
-    private DateTime _gemAttemptAt = DateTime.MinValue;
+    private long _gemAttemptAt = Clock.Never;
+
+    /// <summary>The strategy's restock tab as last passed in — kept only so the
+    /// parameterless latch checks (ConfigErrorStanding) can compare snapshots.</summary>
+    private string _restockTabName = "";
 
     /// <summary>The tab settings as they were when a ConfigError was reported —
     /// while they are unchanged, retrying is pointless and chores stay paused.
@@ -47,7 +55,7 @@ public sealed class ChoresService
     /// automatically.</summary>
     private string? _configErrorSnapshot;
 
-    private string ConfigSnapshot => $"{_settings.DumpTabNames}|{_settings.SimulacrumTabName}";
+    private string ConfigSnapshot => $"{_settings.DumpTabNames}|{_restockTabName}";
 
     /// <summary>Failing-step description of the last failed/misconfigured chore —
     /// forwarded into engine webhooks.</summary>
@@ -97,7 +105,7 @@ public sealed class ChoresService
     /// hideout states — one attempt per 30s window.</summary>
     private bool NeedGems =>
         _settings.LevelGems &&
-        (DateTime.Now - _gemAttemptAt).TotalSeconds > 30 &&
+        Clock.SecondsSince(_gemAttemptAt) > 30 &&
         _gems.HasReadyGems();
 
     /// <summary>A fragment path with no SPARE in device storage or player
@@ -111,16 +119,15 @@ public sealed class ChoresService
         _inventory.CountItems(_inventory.MapDeviceStorage, path) == 0 &&
         _inventory.CountItems(_inventory.MainInventory, path) == 0;
 
-    private bool NeedFragments(IReadOnlyList<string> fragmentPaths) =>
-        CanRestock(fragmentPaths) && fragmentPaths.Any(FragmentMissing);
+    private bool NeedFragments(IReadOnlyList<string> fragmentPaths, string restockTabName) =>
+        CanRestock(fragmentPaths, restockTabName) && fragmentPaths.Any(FragmentMissing);
 
     /// <summary>Whether a fragment restock from the stash tab is configured at all —
     /// the engine uses this to tell "out of fragments" apart from "restock never ran".</summary>
-    public bool CanRestock(IReadOnlyList<string> fragmentPaths) =>
-        fragmentPaths.Count > 0 &&
-        !string.IsNullOrWhiteSpace(_settings.SimulacrumTabName);
+    public bool CanRestock(IReadOnlyList<string> fragmentPaths, string restockTabName) =>
+        fragmentPaths.Count > 0 && !string.IsNullOrWhiteSpace(restockTabName);
 
-    private DateTime _pendingCheckedAt = DateTime.MinValue;
+    private long _pendingCheckedAt = Clock.Never;
     private bool _pendingLast;
 
     /// <summary>
@@ -128,33 +135,36 @@ public sealed class ChoresService
     /// asks every frame while in the hideout, and the underlying checks scan
     /// server inventories and UI panels.
     /// </summary>
-    public bool HasPending(IReadOnlyList<string> fragmentPaths)
+    public bool HasPending(IReadOnlyList<string> fragmentPaths, string restockTabName)
     {
-        if ((DateTime.Now - _pendingCheckedAt).TotalSeconds < 1)
+        if (Clock.SecondsSince(_pendingCheckedAt) < 1)
             return _pendingLast;
 
         // A standing config error pauses the STASH-bound chores — retrying a
         // wrong tab name is pointless until the settings change. Gems don't need
         // the stash and keep running.
+        _restockTabName = restockTabName;
         RefreshConfigLatch();
 
-        _pendingCheckedAt = DateTime.Now;
+        _pendingCheckedAt = Clock.NowMs;
         return _pendingLast = NeedGems ||
                               (_configErrorSnapshot == null &&
-                               (NeedStash || NeedFragments(fragmentPaths)));
+                               (NeedStash || NeedFragments(fragmentPaths, restockTabName)));
     }
 
     /// <summary>
     /// Run all pending chores. Stash-bound chores share one open-panel session.
     /// </summary>
-    public async SyncTask<ChoresResult> Run(IReadOnlyList<string> fragmentPaths, CancellationToken ct)
+    public async SyncTask<ChoresResult> Run(
+        IReadOnlyList<string> fragmentPaths, string restockTabName, CancellationToken ct)
     {
         // While a config error stands, the stash-bound chores stay off (gems still
         // run) — re-attempting them would just re-fail and re-alert every visit.
+        _restockTabName = restockTabName;
         RefreshConfigLatch();
         var configBlocked = _configErrorSnapshot != null;
         var needStash = !configBlocked && NeedStash;
-        var needFragments = !configBlocked && NeedFragments(fragmentPaths);
+        var needFragments = !configBlocked && NeedFragments(fragmentPaths, restockTabName);
         if (!needStash && !needFragments)
         {
             await LevelGemsIfPending(ct);
@@ -188,8 +198,8 @@ public sealed class ChoresService
                 foreach (var path in fragmentPaths)
                 {
                     if (!FragmentMissing(path)) continue;
-                    _log($"[Chores] Restocking a fragment from tab '{_settings.SimulacrumTabName}'...");
-                    var pull = await _stashService.PullItemFromTab(_settings.SimulacrumTabName, path, ct);
+                    _log($"[Chores] Restocking a fragment from tab '{restockTabName}'...");
+                    var pull = await _stashService.PullItemFromTab(restockTabName, path, ct);
                     if (pull == PullResult.Empty)
                     {
                         outOfFragments = true;
@@ -230,7 +240,7 @@ public sealed class ChoresService
     private async SyncTask<bool> LevelGemsIfPending(CancellationToken ct)
     {
         if (!NeedGems) return false;
-        _gemAttemptAt = DateTime.Now;
+        _gemAttemptAt = Clock.NowMs;
         await _gems.LevelReadyGems(ct);
         return true;
     }

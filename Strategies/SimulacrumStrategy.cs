@@ -26,31 +26,21 @@ namespace NightmareAutomate.Strategies;
 /// sees, walks to spawner daemons to trigger their packs, and otherwise holds at
 /// the start area.
 ///
+/// This class is the PHASE MACHINE; the specialist concerns live in composed
+/// components: <see cref="AfflictionatorGateway"/> (initiator finding + wave
+/// state), <see cref="TargetSelector"/> (scoring, stickiness, stall bench) and
+/// <see cref="HuntBehavior"/> (daemon chasing, out-of-bubble hints, shake-off).
+///
 /// No recorded locations: the only discovered things are the wave initiator, the
 /// in-area stash, and the return portal — found by exploring until they stream
-/// into entity range and cached for the current MAP INSTANCE only (area hash),
-/// never across runs or to disk.
+/// into entity range and remembered per MAP INSTANCE in AreaMemory (area hash),
+/// never across instances or to disk.
 /// </summary>
 public sealed class SimulacrumStrategy : IFarmStrategy
 {
     public const string FragmentPath = "Metadata/Items/MapFragments/CurrencyAfflictionFragment";
 
-    /// <summary>Wave initiator entity. Both the containing folder AND the act suffix
-    /// differ per layout (e.g. .../TownArena/Objects/AfflictionatorAct6 in Lunacy's
-    /// Watch, .../Act8_DeliriumTown/Objects/AfflictionatorAct8 in The Syndrome
-    /// Encampment) — only "/Objects/Afflictionator" is common to all. Must not match
-    /// the AfflictionatorPackSpawnerDaemon monsters.</summary>
-    private const string AfflictionatorPathFragment = "/Objects/Afflictionator";
-
-    /// <summary>Invisible spawn-point daemons scattered across the area during a wave.
-    /// Walking near one activates its pack — chasing these replaces blind patrolling.</summary>
-    private const string SpawnerDaemonPathFragment = "LeagueAffliction/AfflictionatorPackSpawnerDaemon";
-
     private const int TotalWaves = 15;
-
-    /// <summary>Targeted before EVERYTHING, even uniques — these totems make the
-    /// monsters around them invulnerable, so nothing dies until they do.</summary>
-    private static readonly string[] PriorityMonsterPaths = ["TotemAlliesCannotDie"];
 
     /// <summary>Never hovered, targeted, or counted as wave presence — Delirium
     /// volatiles explode on their own and must not be chased, and InvisibleAura
@@ -79,104 +69,76 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     private readonly ExplorationService _exploration;
     private readonly InputService _input;
     private readonly GemLevelService _gems;
+    private readonly AreaMemory _areas;
     private readonly NightmareAutomateSettings _settings;
     private readonly Action<string> _log;
+
+    private readonly AfflictionatorGateway _initiator;
+    private readonly TargetSelector _targets;
+    private readonly HuntBehavior _hunt;
 
     /// <summary>
     /// The three discovered positions of the CURRENT map instance: wave initiator,
     /// in-area stash, return portal. Entities stream out with distance, so the last
-    /// seen position is kept to navigate back. Keyed by the area INSTANCE hash —
-    /// static so a bot restart inside the same map keeps them; a new Simulacrum
-    /// instance invalidates them automatically. Never persisted to disk.
+    /// seen position is kept (in the plugin-owned AreaMemory, so a bot restart
+    /// inside the same map keeps them; a new Simulacrum instance has a new hash
+    /// and simply reads nothing). Never persisted to disk.
     /// </summary>
-    private static uint _pointsAreaHash;
-    private static Vector2? _startPointCache;
-    private static Vector2? _stashPointCache;
-    private static Vector2? _portalPointCache;
+    private Vector2? StartPoint => _areas.GetPoint(_gameState.AreaHash, AreaMemory.SimStartKey);
 
-    private void EnsurePointCacheIsForCurrentInstance()
-    {
-        // Only a DIFFERENT Simulacrum instance invalidates — trips to the
-        // hideout/town mid-run must not wipe the points.
-        if (!IsFarmArea(_gameState.AreaName)) return;
-        var hash = _gameState.AreaHash;
-        if (hash == 0 || hash == _pointsAreaHash) return;
-        _pointsAreaHash = hash;
-        _startPointCache = null;
-        _stashPointCache = null;
-        _portalPointCache = null;
-    }
-
-    private Vector2? StartPoint
-    {
-        get { EnsurePointCacheIsForCurrentInstance(); return _startPointCache; }
-        set { EnsurePointCacheIsForCurrentInstance(); _startPointCache = value; }
-    }
-
-    private Vector2? StashPoint
-    {
-        get { EnsurePointCacheIsForCurrentInstance(); return _stashPointCache; }
-        set { EnsurePointCacheIsForCurrentInstance(); _stashPointCache = value; }
-    }
+    private Vector2? StashPoint => _areas.GetPoint(_gameState.AreaHash, AreaMemory.SimStashKey);
 
     private Vector2? PortalPoint
     {
-        get { EnsurePointCacheIsForCurrentInstance(); return _portalPointCache; }
-        set { EnsurePointCacheIsForCurrentInstance(); _portalPointCache = value; }
+        get => _areas.GetPoint(_gameState.AreaHash, AreaMemory.SimPortalKey);
+        set
+        {
+            if (value is { } p)
+                _areas.SetPoint(_gameState.AreaHash, AreaMemory.SimPortalKey, p);
+        }
     }
 
     private SimPhase _phase = SimPhase.MovingToStart;
-    private DateTime _lastMonsterSeenAt = DateTime.MinValue;
-    private DateTime _waveClickAt = DateTime.MinValue;
+    private long _lastMonsterSeenAt = Clock.Never;
+    private long _waveClickAt = Clock.Never;
     private int _waveClickAttempts;
     private int _waveStartReEntries;
-    private DateTime _gemLevelAt = DateTime.MinValue;
+    private long _gemLevelAt = Clock.Never;
     private bool _warnedInventoryFull;
     private bool _settleDone;
     private bool _sawServerMonstersThisWave;
-    private DateTime _lootDivertAt = DateTime.MinValue;
-    private readonly Dictionary<uint, DateTime> _daemonSkipUntil = [];
-    private readonly Dictionary<uint, int> _daemonFailCounts = [];
-    private readonly Dictionary<uint, int> _engageStalls = [];
-    private readonly Dictionary<uint, DateTime> _targetSkipUntil = [];
-
-    /// <summary>Hunting this long without seeing a monster or the server counter
-    /// dropping triggers the shake-off relocation.</summary>
-    private const int HuntFrustrationSeconds = 40;
-
-    private DateTime _huntingSince = DateTime.MinValue;
-    private int _huntLastRemaining;
-    private int _huntShakeoffs;
-    private static readonly Random HuntRandom = new();
+    private long _lootDivertAt = Clock.Never;
 
     public SimulacrumStrategy(
-        NavigationService navigation,
-        GameStateService gameState,
-        LootService lootService,
-        InventoryService inventory,
-        StashService stashService,
-        ExplorationService exploration,
-        InputService input,
-        GemLevelService gems,
+        BotServices services,
         NightmareAutomateSettings settings,
         Action<string> log)
     {
-        _navigation = navigation;
-        _gameState = gameState;
-        _lootService = lootService;
-        _inventory = inventory;
-        _stashService = stashService;
-        _exploration = exploration;
-        _input = input;
-        _gems = gems;
+        _navigation = services.Navigation;
+        _gameState = services.GameState;
+        _lootService = services.Loot;
+        _inventory = services.Inventory;
+        _stashService = services.Stash;
+        _exploration = services.Exploration;
+        _input = services.Input;
+        _gems = services.Gems;
+        _areas = services.Areas;
         _settings = settings;
         _log = log;
+
+        _initiator = new AfflictionatorGateway(_gameState, _areas, log);
+        _targets = new TargetSelector(_gameState, settings, log);
+        _hunt = new HuntBehavior(
+            _gameState, _navigation, _exploration, GetNearbyMonsters,
+            [.. IgnoredMonsterPaths, AfflictionatorGateway.PathFragment], log);
     }
 
     public string Name => "Simulacrum";
     public string CurrentPhaseName => _phase.ToString();
 
     public IReadOnlyList<string> MapDeviceItemPaths { get; } = new[] { FragmentPath };
+
+    public string RestockTabName => _settings.SimulacrumTabName;
 
     public bool IsFarmArea(string areaName) => AreaNameSet.Contains(areaName);
 
@@ -188,26 +150,22 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     public void Reset()
     {
         _phase = SimPhase.MovingToStart;
-        _lastMonsterSeenAt = DateTime.MinValue;
-        _waveClickAt = DateTime.MinValue;
+        _lastMonsterSeenAt = Clock.Never;
+        _waveClickAt = Clock.Never;
         _waveClickAttempts = 0;
         _waveStartReEntries = 0;
-        _gemLevelAt = DateTime.MinValue;
+        _gemLevelAt = Clock.Never;
         _warnedInventoryFull = false;
         _settleDone = false;
         _sawServerMonstersThisWave = false;
-        _lootDivertAt = DateTime.MinValue;
+        _lootDivertAt = Clock.Never;
         _monstersCache = null;
-        _monstersCachedAt = DateTime.MinValue;
+        _monstersCachedAt = Clock.Never;
         _lootService.ForgetAll();
-        _daemonSkipUntil.Clear();
-        _daemonFailCounts.Clear();
-        _engageStalls.Clear();
-        _targetSkipUntil.Clear();
         _temporalAuraCache.Clear();
-        _huntingSince = DateTime.MinValue;
-        _huntLastRemaining = 0;
-        _huntShakeoffs = 0;
+        _initiator.Reset();
+        _targets.Reset();
+        _hunt.Reset();
     }
 
     public async SyncTask<bool> ExecuteFarm(RunContext run, CancellationToken ct)
@@ -222,8 +180,8 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         var abandonAfter = _settings.AbandonRunAfterMinutes;
         if (abandonAfter > 0 && !run.AbandonedByTimer &&
             _phase is not (SimPhase.Finishing or SimPhase.Completed) &&
-            run.RunStartedAt != default &&
-            (DateTime.Now - run.RunStartedAt).TotalMinutes >= abandonAfter)
+            run.RunStartedAt != 0 &&
+            Clock.MsSince(run.RunStartedAt) >= abandonAfter * 60_000L)
         {
             run.AbandonedByTimer = true;
             _log($"[Simulacrum] Run has been going for over {abandonAfter} minutes " +
@@ -251,97 +209,24 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     }
 
     /// <summary>
-    /// The wave initiator, when streamed into memory. Entities load/unload with
-    /// distance — a null here often just means "too far away", which is why
-    /// navigation falls back to the position remembered for this run.
-    /// Remembers its position (and the stash's) for the CURRENT run when seen.
-    /// </summary>
-    private Entity? FindAfflictionator()
-    {
-        var aff = _gameState.FindEntitiesByPath(AfflictionatorPathFragment)
-            .FirstOrDefault(e => e.IsValid);
-
-        if (aff != null)
-            StartPoint = aff.GridPosNum;
-
-        var stash = _gameState.FindStash();
-        if (stash != null)
-            StashPoint = stash.GridPosNum;
-
-        return aff;
-    }
-
-    /// <summary>
-    /// Read the wave state from the Afflictionator's StateMachine. Verified live:
-    /// 'active' is the wave-running flag (1 during, 0 idle) BUT stays 1 forever once
-    /// the run is complete; 'wave' is the wave counter and PERSISTS between waves
-    /// (idle after wave 1 reads active:0/wave:1), so only 'active' may decide whether
-    /// a wave is running; 'goodbye' flips to 1 exactly at 15/15 completion — the
-    /// authoritative end-of-run signal.
-    /// Nulls when the state can't be read (entity unloaded / component missing).
-    /// </summary>
-    private (bool? Active, int? WaveNumber, bool? Goodbye) GetWaveState(Entity? afflictionator)
-    {
-        try
-        {
-            var states = afflictionator?.GetComponent<StateMachine>()?.States;
-            if (states == null) return (null, null, null);
-
-            long active = 0, wave = 0, goodbye = 0;
-            var found = false;
-            foreach (var s in states)
-            {
-                if (s.Name == "active") { active = s.Value; found = true; }
-                else if (s.Name == "wave") { wave = s.Value; }
-                else if (s.Name == "goodbye") { goodbye = s.Value; }
-            }
-
-            if (!found) return (null, null, null);
-            return (active != 0, wave > 0 ? (int)wave : null, goodbye != 0);
-        }
-        catch
-        {
-            return (null, null, null);
-        }
-    }
-
-    private bool? IsWaveActive(Entity? afflictionator) => GetWaveState(afflictionator).Active;
-
-    private bool? IsRunComplete(Entity? afflictionator) => GetWaveState(afflictionator).Goodbye;
-
-    /// <summary>
     /// Shared 15/15 handling ('goodbye' is the authoritative end-of-run signal):
     /// route through the loot pause first (throttled, so unpickable leftovers
     /// can't loop us), then finish. Null while the run is not complete.
     /// </summary>
     private SimPhase? CheckRunComplete(Entity? afflictionator)
     {
-        if (IsRunComplete(afflictionator) != true) return null;
+        if (_initiator.IsRunComplete(afflictionator) != true) return null;
 
         if (_lootService.HasKnownLoot() &&
-            (DateTime.Now - _lootDivertAt).TotalSeconds > 30)
+            Clock.SecondsSince(_lootDivertAt) > 30)
         {
-            _lootDivertAt = DateTime.Now;
+            _lootDivertAt = Clock.NowMs;
             _log("[Simulacrum] Run complete -- collecting the remaining loot first.");
             return SimPhase.LootPause;
         }
 
         _log("[Simulacrum] Initiator says goodbye -- run complete.");
         return SimPhase.Finishing;
-    }
-
-    /// <summary>
-    /// The initiator's wave counter is the truth — e.g. when the bot is started at
-    /// wave 5, our own count would otherwise begin at 1.
-    /// </summary>
-    private void SyncWaveNumber(RunContext run, Entity? afflictionator)
-    {
-        var (_, waveNumber, _) = GetWaveState(afflictionator);
-        if (waveNumber.HasValue && waveNumber.Value != run.WavesStarted)
-        {
-            _log($"[Simulacrum] Wave counter synced from initiator: {run.WavesStarted} -> {waveNumber.Value}.");
-            run.WavesStarted = waveNumber.Value;
-        }
     }
 
     private async SyncTask<SimPhase> DoMovingToStart(RunContext run, CancellationToken ct)
@@ -355,8 +240,6 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                 await Task.Delay(1500, ct);
         }
 
-        var area = _gameState.AreaName;
-
         // Resuming mid-wave (bot restarted inside the map): monsters are already
         // around us — adopt the running wave right here instead of walking away.
         if (GetNearbyMonsters().Count > 0)
@@ -367,7 +250,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
         // The initiator only needs to be STREAMED IN to read its state (verified
         // readable at 160+ units) — never walk on top of it just to look at it.
-        var aff = FindAfflictionator();
+        var aff = _initiator.Find();
         if (aff != null)
             return SimPhase.StartingWave;
 
@@ -377,14 +260,14 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         {
             _log($"[Simulacrum] Moving toward the start point {startPoint}...");
             await _navigation.MoveToTarget(startPoint, ct, 90);
-            aff = FindAfflictionator();
+            aff = _initiator.Find();
 
             if (aff == null &&
                 Vector2.Distance(_gameState.PlayerGridPos, startPoint) < 100)
             {
                 // Close and still nothing — step in further before giving up.
                 await _navigation.MoveToTarget(startPoint, ct, 20);
-                aff = FindAfflictionator();
+                aff = _initiator.Find();
             }
 
             if (aff != null)
@@ -397,10 +280,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             // initiator streams into entity range. Throttled: the full-list path
             // scan must not run every frame of the walk.
             await _exploration.WalkTourLeg(
-                WaitHelpers.Throttle(() => _gameState.FindEntitiesByPath(AfflictionatorPathFragment)
-                    .Any(e => e.IsValid), 250), ct);
+                WaitHelpers.Throttle(() => _initiator.Find() != null, 250), ct);
 
-            if (FindAfflictionator() != null)
+            if (_initiator.Find() != null)
             {
                 _log($"[Simulacrum] Initiator discovered at {StartPoint}.");
                 return SimPhase.StartingWave;
@@ -417,8 +299,8 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     {
         // Wave already running (adopted run, click landed, or monsters wandered in).
         var monsters = GetNearbyMonsters();
-        var aff = FindAfflictionator();
-        SyncWaveNumber(run, aff); // the initiator's counter wins when readable
+        var aff = _initiator.Find();
+        _initiator.SyncWaveNumber(run, aff); // the initiator's counter wins when readable
 
         // 15/15 complete: 'active' never goes idle again after the final wave —
         // 'goodbye' is the authoritative end-of-run signal (verified live).
@@ -431,7 +313,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // active (and untargetable) while the rewards materialize — active=1 with
         // MonstersRemaining=0 is not a running wave. Loot as it appears; the state
         // flips to idle when the phase ends.
-        if (monsters.Count == 0 && IsWaveActive(aff) == true &&
+        if (monsters.Count == 0 && _initiator.IsWaveActive(aff) == true &&
             _sawServerMonstersThisWave && _gameState.MonstersRemaining == 0)
         {
             if (_lootService.HasKnownLoot())
@@ -442,16 +324,16 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         }
 
         // A running wave (our click landed, or an adopted run): count it and fight.
-        if (IsWaveActive(aff) == true)
+        if (_initiator.IsWaveActive(aff) == true)
         {
             run.WavesStarted++;
-            SyncWaveNumber(run, aff);
+            _initiator.SyncWaveNumber(run, aff);
             _waveClickAttempts = 0;
-            _lastMonsterSeenAt = DateTime.Now;
+            _lastMonsterSeenAt = Clock.NowMs;
             _sawServerMonstersThisWave = false;
             // The wave start destroyed all ground items — stale spots must not linger.
             _lootService.ForgetAll();
-            LogAfflictionatorStates(aff, $"wave {run.WavesStarted} started");
+            _initiator.LogStates(aff, $"wave {run.WavesStarted} started");
             return SimPhase.Fighting;
         }
 
@@ -461,7 +343,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // destroyed. The counter syncs from the initiator once it is readable.
         if (monsters.Count > 0)
         {
-            _lastMonsterSeenAt = DateTime.Now;
+            _lastMonsterSeenAt = Clock.NowMs;
             return SimPhase.Fighting;
         }
 
@@ -479,9 +361,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // range are irrelevant). Throttled so unpickable leftovers can't loop us
         // between looting and clicking forever.
         if (_lootService.HasKnownLoot() &&
-            (DateTime.Now - _lootDivertAt).TotalSeconds > 30)
+            Clock.SecondsSince(_lootDivertAt) > 30)
         {
-            _lootDivertAt = DateTime.Now;
+            _lootDivertAt = Clock.NowMs;
             _log("[Simulacrum] Loot on the ground -- collecting it before the next wave.");
             return SimPhase.LootPause;
         }
@@ -495,7 +377,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // leftovers), clicking on is deliberate and the walk must finish.
         if (Vector2.Distance(_gameState.PlayerGridPos, aff.GridPosNum) > 90)
         {
-            var divertAvailable = (DateTime.Now - _lootDivertAt).TotalSeconds > 30;
+            var divertAvailable = Clock.SecondsSince(_lootDivertAt) > 30;
             await _navigation.MoveToTarget(aff.GridPosNum, ct, 70,
                 stopWhen: divertAvailable
                     ? WaitHelpers.Throttle(() =>
@@ -521,7 +403,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             await TryLevelGems(ct);
 
         // Throttle clicks: give a click a moment to register before the next try.
-        if (_waveClickAt != DateTime.MinValue && (DateTime.Now - _waveClickAt).TotalSeconds < 1.5)
+        if (_waveClickAt != Clock.Never && Clock.SecondsSince(_waveClickAt) < 1.5)
         {
             await TaskUtils.NextFrame();
             return SimPhase.StartingWave;
@@ -536,7 +418,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             {
                 _waveStartReEntries++;
                 _waveClickAttempts = 0;
-                _waveClickAt = DateTime.MinValue;
+                _waveClickAt = Clock.Never;
                 _log("[Simulacrum] Wave will not start -- re-entering through a portal to reset the instance.");
                 run.ReEntryRequested = true;
                 return SimPhase.MovingToStart;
@@ -547,7 +429,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         }
 
         _waveClickAttempts++;
-        _waveClickAt = DateTime.Now;
+        _waveClickAt = Clock.NowMs;
         // The counter belongs to the PREVIOUS wave until the new one registers —
         // clearing it here keeps the loot-spawn branch from misreading the gap
         // between the click and the server's first monster count.
@@ -586,12 +468,12 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     private async SyncTask<bool> TryLevelGems(CancellationToken ct)
     {
         if (!_settings.LevelGems) return false;
-        if ((DateTime.Now - _gemLevelAt).TotalSeconds < 20) return false;
+        if (Clock.SecondsSince(_gemLevelAt) < 20) return false;
         if (GetNearbyMonsters().Count > 0) return false;
 
         // Stamp BEFORE the panel scan: HasReadyGems walks every popup's children,
         // which must not run every frame of a quiet phase.
-        _gemLevelAt = DateTime.Now;
+        _gemLevelAt = Clock.NowMs;
         if (!_gems.HasReadyGems()) return false;
 
         await _navigation.ReleaseMoveKey();
@@ -612,12 +494,11 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
         if (monsters.Count > 0)
         {
-            _lastMonsterSeenAt = DateTime.Now;
+            _lastMonsterSeenAt = Clock.NowMs;
             // Contact = the hunt worked; disarm the frustration guard.
-            _huntingSince = DateTime.MinValue;
-            _huntShakeoffs = 0;
+            _hunt.NoteContact();
 
-            var target = PickTarget(monsters);
+            var target = _targets.Pick(monsters);
             if (target == null)
             {
                 await TaskUtils.NextFrame();
@@ -630,15 +511,15 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         }
 
         // No targetable monsters nearby. The wave may be over, or spawns are elsewhere.
-        var aff = FindAfflictionator();
-        var waveActive = IsWaveActive(aff);
-        SyncWaveNumber(run, aff);
+        var aff = _initiator.Find();
+        var waveActive = _initiator.IsWaveActive(aff);
+        _initiator.SyncWaveNumber(run, aff);
 
         // The initiator's state flag is authoritative (verified live: active/wave = 1
         // during a wave, 0 when idle).
         if (waveActive == false)
         {
-            LogAfflictionatorStates(aff, $"wave {run.WavesStarted} cleared (initiator idle)");
+            _initiator.LogStates(aff, $"wave {run.WavesStarted} cleared (initiator idle)");
             return SimPhase.LootPause;
         }
 
@@ -650,7 +531,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (waveActive != false && _sawServerMonstersThisWave && _gameState.MonstersRemaining == 0)
         {
             _log("[Simulacrum] Server reports 0 monsters remaining -- moving to collect the wave loot.");
-            _waveClickAt = DateTime.MinValue;
+            _waveClickAt = Clock.Never;
             return SimPhase.LootPause;
         }
 
@@ -663,11 +544,11 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // Only return to the initiator when the wave TRULY can't be confirmed —
         // the server counter is readable from anywhere, so a positive count is
         // confirmation enough even while hunting far away from the initiator.
-        if (waveActive != true && SecondsSince(_lastMonsterSeenAt) > 10 &&
+        if (waveActive != true && Clock.SecondsSince(_lastMonsterSeenAt) > 10 &&
             !(_sawServerMonstersThisWave && _gameState.MonstersRemaining > 0))
         {
             _log("[Simulacrum] Can't confirm a running wave -- returning to the initiator.");
-            _waveClickAt = DateTime.MinValue;
+            _waveClickAt = Clock.Never;
             return SimPhase.StartingWave;
         }
 
@@ -676,27 +557,19 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // every tick forever. When the hunt has made no progress for a while,
         // relocate somewhere genuinely different first — that un-wedges the
         // character AND shifts the network bubble so other entities stream in.
-        if (_gameState.MonstersRemaining > 0 && await ShakeOffIfHuntStuck(ct))
+        if (_gameState.MonstersRemaining > 0 && await _hunt.ShakeOffIfStuck(ct))
             return SimPhase.Fighting;
 
         // Prefer chasing the spawner daemons — walking near one activates its pack
         // (unspawned packs have no monster entities yet, only these daemons).
-        // Daemons that couldn't be reached are skipped with an escalating backoff
-        // (a genuinely unreachable one must stop dominating the nearest-first
-        // pick). The walk aborts as soon as monsters appear.
-        var daemon = FindNearestSpawnerDaemon();
+        // The walk aborts as soon as monsters appear.
+        var daemon = _hunt.FindNearestSpawnerDaemon();
         if (daemon != null)
         {
             var reached = await _navigation.MoveToTarget(daemon.GridPosNum, ct, 20,
                 stopWhen: StopWhenMonstersNearby());
             if (!reached && daemon.IsValid && GetNearbyMonsters().Count == 0)
-            {
-                var fails = _daemonFailCounts.GetValueOrDefault(daemon.Id) + 1;
-                _daemonFailCounts[daemon.Id] = fails;
-                var skipSeconds = fails switch { 1 => 10, 2 => 30, _ => 60 };
-                _daemonSkipUntil[daemon.Id] = DateTime.Now.AddSeconds(skipSeconds);
-                _log($"[Simulacrum] Spawn point unreachable ({fails}x) -- skipping it for {skipSeconds}s.");
-            }
+                _hunt.ReportDaemonUnreachable(daemon);
             return SimPhase.Fighting;
         }
 
@@ -705,7 +578,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // invalid-but-alive, frozen at their last-known position — walk there
         // directly. Once close, they stream in and normal targeting takes over.
         if (_gameState.MonstersRemaining > 0 &&
-            FindNearestOutOfBubbleMonster() is { } lastKnown)
+            _hunt.FindNearestOutOfBubbleMonster() is { } lastKnown)
         {
             _log($"[Simulacrum] Hunting a remaining monster last seen near {lastKnown}...");
             await _navigation.MoveToTarget(lastKnown, ct, 30,
@@ -732,141 +605,6 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     }
 
     /// <summary>
-    /// Last-known position of the nearest alive monster OUTSIDE the network
-    /// bubble: Monster-type entries in the full entity list with IsValid=false
-    /// but cached IsAlive/IsHostile. The data is a frozen snapshot — a hint of
-    /// where to walk, never something to fight. Positions closer than 50 units
-    /// are skipped: if we stand there and the monster still isn't streamed in,
-    /// the snapshot is stale (wandered off or died out of view).
-    /// </summary>
-    private Vector2? FindNearestOutOfBubbleMonster()
-    {
-        var playerPos = _gameState.PlayerGridPos;
-        Vector2? best = null;
-        var bestDist = float.MaxValue;
-
-        try
-        {
-            foreach (var e in _gameState.Controller.EntityListWrapper.Entities)
-            {
-                try
-                {
-                    if (e == null || e.IsValid || e.Type != EntityType.Monster) continue;
-                    if (!e.IsAlive || !e.IsHostile) continue;
-
-                    var path = e.Path;
-                    if (path == null || IgnoredMonsterPaths.Any(path.Contains) ||
-                        path.Contains(AfflictionatorPathFragment))
-                        continue;
-
-                    var d = Vector2.Distance(playerPos, e.GridPosNum);
-                    if (d > 50 && d < bestDist)
-                    {
-                        bestDist = d;
-                        best = e.GridPosNum;
-                    }
-                }
-                catch
-                {
-                    // Invalid entities carry stale addresses — skip anything unreadable.
-                }
-            }
-        }
-        catch
-        {
-            // The live entity list can mutate mid-enumeration — just use what we
-            // got this tick; the next tick rescans.
-        }
-
-        return best;
-    }
-
-    /// <summary>
-    /// Hunt watchdog. Hunting = wave alive, nothing targetable near us. The clock
-    /// (re)arms on progress — first hunt tick, monster contact (reset in
-    /// DoFighting), or the server counter dropping. Past the threshold: first
-    /// strike walks to a RANDOM far tour point (ignoring the daemon/last-known
-    /// hints that keep leading into the same corner), second strike walks a full
-    /// exploration lap. Returns true when a shake-off walk ran this tick.
-    /// </summary>
-    private async SyncTask<bool> ShakeOffIfHuntStuck(CancellationToken ct)
-    {
-        var remaining = _gameState.MonstersRemaining;
-
-        if (_huntingSince == DateTime.MinValue)
-        {
-            // Hunt just started — arm the clock, no shake-off yet.
-            _huntingSince = DateTime.Now;
-            _huntLastRemaining = remaining;
-            return false;
-        }
-
-        if (remaining < _huntLastRemaining)
-        {
-            // Something died (ReAgent off-screen kill, volatile, ...) — progress.
-            _huntingSince = DateTime.Now;
-            _huntLastRemaining = remaining;
-            _huntShakeoffs = 0;
-            return false;
-        }
-
-        // More spawns registering is not hunt progress, but track the high-water
-        // mark so a later kill still reads as a decrease.
-        if (remaining > _huntLastRemaining)
-            _huntLastRemaining = remaining;
-
-        if (SecondsSince(_huntingSince) < HuntFrustrationSeconds)
-            return false;
-
-        _huntShakeoffs++;
-        _huntingSince = DateTime.Now; // fresh window after the shake-off
-
-        // Abort the relocation the moment monsters appear or the wave truly ends.
-        var stop = WaitHelpers.Throttle(
-            () => GetNearbyMonsters().Count > 0 || _gameState.MonstersRemaining == 0, 250);
-
-        var tour = _exploration.GetTour();
-        if (_huntShakeoffs == 1 && tour is { Count: > 0 })
-        {
-            var playerPos = _gameState.PlayerGridPos;
-            var farPoints = tour.Where(p => Vector2.Distance(playerPos, p) > 60).ToList();
-            var pick = farPoints.Count > 0
-                ? farPoints[HuntRandom.Next(farPoints.Count)]
-                : tour[HuntRandom.Next(tour.Count)];
-            _log("[Simulacrum] Hunt is stuck -- relocating to a random spot to reset.");
-            await _navigation.MoveToTarget(pick, ct, 20, stopWhen: stop);
-            return true;
-        }
-
-        // Second strike (or no tour available): walk at most one full lap.
-        // Bounded — a monster in an unreachable pocket must not trap the phase
-        // machine inside an endless ExploreUntil.
-        _log("[Simulacrum] Hunt is still stuck -- walking a full exploration lap.");
-        var legs = Math.Max(8, tour?.Count ?? 8);
-        for (var i = 0; i < legs && !ct.IsCancellationRequested && !stop(); i++)
-        {
-            if (!_gameState.IsConnected) break;
-            await _exploration.WalkTourLeg(stop, ct);
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Nearest alive pack-spawner daemon anywhere in entity range, skipping ones
-    /// recently found unreachable.
-    /// </summary>
-    private Entity? FindNearestSpawnerDaemon()
-    {
-        var playerPos = _gameState.PlayerGridPos;
-        return _gameState.FindEntitiesByPath(SpawnerDaemonPathFragment)
-            .Where(e => e.IsValid && e.IsAlive &&
-                        (!_daemonSkipUntil.TryGetValue(e.Id, out var until) || DateTime.Now > until))
-            .OrderBy(e => Vector2.Distance(playerPos, e.GridPosNum))
-            .FirstOrDefault();
-    }
-
-    /// <summary>
     /// The wave loot skeleton: pickup passes with deposit-and-reloot when an item
     /// does not fit, PLUS a guaranteed visit to the loot point before concluding —
     /// mid-wave drops can pull the pickup far away, and the wave
@@ -882,7 +620,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // seconds of the wave ending, so time already spent picking counts against
         // this window — a pickup that took longer than the window means the
         // rewards are long since spawned and there is nothing left to wait for.
-        var spawnDeadline = DateTime.Now.AddSeconds(_settings.LootSpawnWaitSeconds);
+        var spawnDeadline = Clock.InSeconds(_settings.LootSpawnWaitSeconds);
         var result = LootResult.AllPicked;
         for (var pass = 0; pass < 6 && !ct.IsCancellationRequested; pass++)
         {
@@ -923,7 +661,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                 {
                     visitedLootPoint = true;
 
-                    while (DateTime.Now < spawnDeadline && !ct.IsCancellationRequested &&
+                    while (!Clock.Reached(spawnDeadline) && !ct.IsCancellationRequested &&
                            !_lootService.HasKnownLoot() && GetNearbyMonsters().Count == 0)
                     {
                         await Task.Delay(200, ct);
@@ -945,9 +683,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
             // Everything picked and the loot point checked — linger briefly: the
             // game sometimes spawns a single reward item well after the rest.
-            var lingerUntil = DateTime.Now.AddSeconds(_settings.LateLootLingerSeconds);
+            var lingerUntil = Clock.InSeconds(_settings.LateLootLingerSeconds);
             var lateLoot = false;
-            while (DateTime.Now < lingerUntil && !ct.IsCancellationRequested)
+            while (!Clock.Reached(lingerUntil) && !ct.IsCancellationRequested)
             {
                 if (abortWhen?.Invoke() == true)
                     return LootResult.Aborted;
@@ -977,7 +715,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
         // Rewards drop around the start location — being near the initiator is enough
         // for the labels to be detected.
-        var lootPoint = FindAfflictionator()?.GridPosNum ?? StartPoint;
+        var lootPoint = _initiator.Find()?.GridPosNum ?? StartPoint;
 
         var result = await RunLootPasses(lootPoint,
             abortWhen: StopWhenMonstersNearby(), ct);
@@ -996,7 +734,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (result == LootResult.AllPicked)
             await TryLevelGems(ct);
 
-        _waveClickAt = DateTime.MinValue;
+        _waveClickAt = Clock.Never;
         return SimPhase.StartingWave;
     }
 
@@ -1009,7 +747,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
         // The way back must be DISCOVERED, never assumed: if no portal was seen this
         // run (e.g. the bot was started mid-run), walk the exploration tour until one
-        // streams into the bubble.
+        // streams into the bubble. Deadline-bounded: if none shows up, conclude
+        // anyway — the engine's ReturningToHideout has its own (webhook-alerting)
+        // portal search and owns the truly-stuck case.
         if (run.MapEntryPoint == null && _gameState.GetTownPortals().Count == 0)
         {
             _log("[Simulacrum] No portal discovered this run -- searching the area for it.");
@@ -1018,8 +758,10 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             if (_gameState.TryForceRefreshArea())
                 await Task.Delay(1000, ct);
 
+            var deadline = Clock.InMinutes(3);
             await _exploration.ExploreUntil(
-                WaitHelpers.Throttle(() => _gameState.GetTownPortals().Count > 0, 250), ct);
+                WaitHelpers.Throttle(
+                    () => _gameState.GetTownPortals().Count > 0 || Clock.Reached(deadline), 250), ct);
 
             var portal = _gameState.GetTownPortals()
                 .OrderBy(p => Vector2.Distance(_gameState.PlayerGridPos, p.GridPosNum))
@@ -1029,14 +771,21 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                 run.MapEntryPoint = portal.GridPosNum;
                 _log($"[Simulacrum] Portal discovered at {portal.GridPosNum}.");
             }
+            else
+            {
+                _log("[Simulacrum] No portal found within 3 minutes -- handing the search to the engine.");
+            }
         }
 
         return SimPhase.Completed;
     }
 
     /// <summary>
-    /// Walk to the in-area stash (via the position remembered this run while the
-    /// entity is not yet streamed in; exploring for it if never seen) and deposit.
+    /// Walk to the in-area stash (via the position remembered this instance while
+    /// the entity is not yet streamed in; exploring for it if never seen) and
+    /// deposit. The exploration is deadline-bounded so a stash that never streams
+    /// in cannot loop the pause forever — the deposit attempt below then fails
+    /// gracefully and the loot pass carries on with what fits.
     /// </summary>
     private async SyncTask<bool> StashInArea(CancellationToken ct)
     {
@@ -1048,15 +797,19 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             }
             else
             {
-                // Stash never seen this run — explore until it streams in. Throttled:
-                // FindStash falls back to a full-list path scan while it is missing,
-                // which is the common case during the search.
+                // Stash never seen this instance — explore until it streams in.
+                // Throttled: FindStash falls back to a full-list path scan while
+                // it is missing, which is the common case during the search.
                 _log("[Simulacrum] Looking for the in-area stash...");
+                var deadline = Clock.InMinutes(3);
                 await _exploration.ExploreUntil(
-                    WaitHelpers.Throttle(() => _gameState.FindStash() != null, 250), ct);
+                    WaitHelpers.Throttle(
+                        () => _gameState.FindStash() != null || Clock.Reached(deadline), 250), ct);
 
                 if (_gameState.FindStash() is { } found)
-                    StashPoint = found.GridPosNum;
+                    _areas.SetPoint(_gameState.AreaHash, AreaMemory.SimStashKey, found.GridPosNum);
+                else
+                    _log("[Simulacrum] No stash found within 3 minutes -- attempting the deposit anyway.");
             }
         }
 
@@ -1073,8 +826,8 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     /// <summary>
     /// Move within hover range of the target, then park the mouse on its
     /// Render.InteractCenter so ReAgent can engage. Uniques use their own
-    /// preferred distance setting. (Reachability is guarded by the combat-progress
-    /// watchdog in the Fighting phase, which covers approach and hover alike.)
+    /// preferred distance setting. (Reachability is guarded by the stall bench
+    /// in TargetSelector, which covers approach and hover alike.)
     /// </summary>
     private async SyncTask<bool> EngageTarget(Entity target, CancellationToken ct)
     {
@@ -1111,7 +864,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             // reposition for override: ACD totems, temporal-bubble rares, uniques.
             if (_settings.NoMovementDuringAbilities &&
                 _gameState.IsPlayerAttacking &&
-                TargetScore(target) < 100 &&
+                TargetSelector.TargetScore(target) < 100 &&
                 target.Rarity != MonsterRarity.Unique &&
                 !(target.Rarity == MonsterRarity.Rare && HasTemporalAura(target)))
             {
@@ -1119,8 +872,8 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                 return true;
             }
 
-            var currentScore = TargetScore(target);
-            var lastRecheck = DateTime.MinValue;
+            var currentScore = TargetSelector.TargetScore(target);
+            var lastRecheck = Clock.Never;
 
             // Freeze the last valid position so the route has a stable destination
             // during the brief window between the target despawning and stopWhen
@@ -1155,13 +908,13 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                     // higher tier appeared, or when we are trekking to something
                     // OUTSIDE the near band while a target INSIDE it exists
                     // (near-first: never cross the map through packs).
-                    if ((DateTime.Now - lastRecheck).TotalMilliseconds > 250)
+                    if (Clock.MsSince(lastRecheck) > 250)
                     {
-                        lastRecheck = DateTime.Now;
-                        var best = PickTarget(GetNearbyMonsters());
+                        lastRecheck = Clock.NowMs;
+                        var best = _targets.Pick(GetNearbyMonsters());
                         if (best != null && best.Id != target.Id)
                         {
-                            if (TargetScore(best) > currentScore)
+                            if (TargetSelector.TargetScore(best) > currentScore)
                                 return true;
 
                             float nearRadius = _settings.NearTargetRadius;
@@ -1177,28 +930,16 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
             // Stall guard: the walk ended, yet we neither moved nor gained
             // range+sight on a still-valid target (dead-end wall, unwalkable
-            // pocket, no route). Re-walking the same target every tick would
-            // freeze the bot on it — after a few stalls, bench it briefly so
+            // pocket, no route). The selector benches repeat offenders so
             // targeting moves on to something reachable.
             var stalled = target.IsValid && target.IsAlive &&
                           Vector2.Distance(_gameState.PlayerGridPos, posBefore) < 3 &&
                           (Vector2.Distance(_gameState.PlayerGridPos, target.GridPosNum) > hoverRange ||
                            !_gameState.HasLineOfSight(_gameState.PlayerGridPos, target.GridPosNum));
             if (stalled)
-            {
-                var stalls = _engageStalls.GetValueOrDefault(target.Id) + 1;
-                _engageStalls[target.Id] = stalls;
-                if (stalls >= 3)
-                {
-                    _engageStalls.Remove(target.Id);
-                    _targetSkipUntil[target.Id] = DateTime.Now.AddSeconds(5);
-                    _log("[Simulacrum] Can't reach or sight the target -- benching it for a bit.");
-                }
-            }
+                _targets.ReportEngageStall(target.Id);
             else
-            {
-                _engageStalls.Remove(target.Id);
-            }
+                _targets.ClearEngageStalls(target.Id);
 
             return true;
         }
@@ -1210,7 +951,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     }
 
     private IReadOnlyList<Entity>? _monstersCache;
-    private DateTime _monstersCachedAt = DateTime.MinValue;
+    private long _monstersCachedAt = Clock.Never;
 
     /// <summary>
     /// Viable wave monsters: alive + hostile + targetable (service-level), minus the
@@ -1220,15 +961,15 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     /// </summary>
     private IReadOnlyList<Entity> GetNearbyMonsters()
     {
-        if (_monstersCache != null && (DateTime.Now - _monstersCachedAt).TotalMilliseconds < 100)
+        if (_monstersCache != null && Clock.MsSince(_monstersCachedAt) < 100)
             return _monstersCache;
 
-        _monstersCachedAt = DateTime.Now;
+        _monstersCachedAt = Clock.NowMs;
         // No radius: the server's network bubble already bounds the entity list.
         return _monstersCache = _gameState.FindNearbyMonsters()
             // Never treat the wave-initiator NPC as a monster, no matter how the
             // game happens to classify it in the entity list.
-            .Where(m => m.Path == null || !m.Path.Contains(AfflictionatorPathFragment))
+            .Where(m => m.Path == null || !m.Path.Contains(AfflictionatorGateway.PathFragment))
             .Where(m => m.Path == null || !IgnoredMonsterPaths.Any(m.Path.Contains))
             .ToList();
     }
@@ -1247,7 +988,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (_temporalAuraCache.TryGetValue(target.Id, out var cached))
             return cached;
 
-        try
+        return SafeRead.Try("sim.temporal-aura", () =>
         {
             var mods = target.GetComponent<ObjectMagicProperties>()?.Mods;
             if (mods == null) return false;
@@ -1255,96 +996,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             var has = mods.Any(m => m != null && m.Contains("MonsterModTemporalAura"));
             _temporalAuraCache[target.Id] = has;
             return has;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private uint _currentTargetId;
-    private DateTime _targetAcquiredAt = DateTime.MinValue;
-
-    /// <summary>
-    /// Target selection. NEAR-FIRST: anything within NearTargetRadius is fought
-    /// before anything beyond it — the bot never runs off through packs to a
-    /// distant rare. (ACD totems keep working: their aura only protects monsters
-    /// near the TOTEM, so when invulnerable monsters are hitting us, the totem is
-    /// inside the near band too.) Within the chosen band: ACD totems and uniques
-    /// are ALWAYS on top (priority tier). Everything else blends rarity with pack
-    /// size — each rarity step is worth PackSizePerTier clustered monsters, so a
-    /// big enough magic pack outranks a lone rare and a big enough white pack
-    /// outranks a lone magic (hovering the pack center gives ReAgent's AOE the
-    /// most value). TIME-sticky: the current target is held for TargetStickSeconds
-    /// unless it dies, leaves the pool, or a priority target (totem/unique)
-    /// appears — prevents flip-flopping between equal picks.
-    /// </summary>
-    private Entity? PickTarget(IReadOnlyList<Entity> monsters)
-    {
-        // Targets the engage stall guard benched sit out until their skip expires.
-        // If that leaves nothing, we idle quietly (ReAgent still fights whatever
-        // is near) instead of re-walking into the same wall.
-        if (_targetSkipUntil.Count > 0)
-        {
-            var now = DateTime.Now;
-            monsters = monsters
-                .Where(m => !_targetSkipUntil.TryGetValue(m.Id, out var until) || now > until)
-                .ToList();
-        }
-
-        if (monsters.Count == 0)
-        {
-            _currentTargetId = 0;
-            return null;
-        }
-
-        var playerPos = _gameState.PlayerGridPos;
-        float nearRadius = _settings.NearTargetRadius;
-        float clusterRadius = _settings.ClusterRadius;
-
-        var near = monsters
-            .Where(m => Vector2.Distance(playerPos, m.GridPosNum) <= nearRadius)
-            .ToList();
-        var pool = near.Count > 0 ? near : monsters;
-
-        float Dist(Entity m) => Vector2.Distance(playerPos, m.GridPosNum);
-        int Cluster(Entity m) =>
-            monsters.Count(o => Vector2.Distance(o.GridPosNum, m.GridPosNum) <= clusterRadius);
-
-        // Rarity blended with pack size: one rarity step is worth PackSizePerTier
-        // clustered monsters (lone rare = 2 steps, so a magic with a pack of
-        // PackSizePerTier+1 around it wins; a white pack needs 2x+1).
-        var packWeight = Math.Max(1, _settings.PackSizePerTier);
-        int PackScore(Entity m) => (int)m.Rarity * packWeight + Cluster(m);
-
-        // Priority tier first (totems, then uniques — always on top), then the
-        // blended pack score, distance as the final tie-break.
-        var best = pool
-            .OrderByDescending(TargetScore)
-            .ThenByDescending(PackScore)
-            .ThenBy(Dist)
-            .First();
-
-        // Time-based stickiness: hold the current target briefly so equal picks
-        // can't ping-pong between frames. A current target outside the pool
-        // (e.g. far away while near monsters exist) is deliberately not searched
-        // for — it must lose the target. A strictly higher priority tier always
-        // switches instantly.
-        var current = pool.FirstOrDefault(m => m.Id == _currentTargetId);
-        if (current != null && best.Id != current.Id &&
-            TargetScore(best) <= TargetScore(current) &&
-            (DateTime.Now - _targetAcquiredAt).TotalSeconds < _settings.TargetStickSeconds)
-        {
-            return current;
-        }
-
-        if (best.Id != _currentTargetId)
-        {
-            _currentTargetId = best.Id;
-            _targetAcquiredAt = DateTime.Now;
-        }
-
-        return best;
+        });
     }
 
     /// <summary>
@@ -1354,19 +1006,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     private Func<bool> StopWhenMonstersNearby() =>
         WaitHelpers.Throttle(() => GetNearbyMonsters().Count > 0, 250);
 
-    /// <summary>
-    /// PRIORITY tier: ACD totems above everything, then uniques — these always
-    /// outrank any pack. Everything else scores 0 here and competes via the
-    /// blended pack score instead. Used both for picking and for "did something
-    /// strictly better appear" checks — cluster/distance deliberately not
-    /// included, so ordinary packs can't abort walks or break the target stick.
-    /// </summary>
-    private static int TargetScore(Entity m) =>
-        m.Path != null && PriorityMonsterPaths.Any(m.Path.Contains) ? 100
-        : m.Rarity == MonsterRarity.Unique ? 10
-        : 0;
-
-    private DateTime _portalCheckedAt = DateTime.MinValue;
+    private long _portalCheckedAt = Clock.Never;
 
     /// <summary>
     /// Keep the return-portal position current: portals move when the player drops a
@@ -1376,8 +1016,8 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     /// </summary>
     private void UpdatePortalKnowledge(RunContext run)
     {
-        if ((DateTime.Now - _portalCheckedAt).TotalSeconds < 2) return;
-        _portalCheckedAt = DateTime.Now;
+        if (Clock.SecondsSince(_portalCheckedAt) < 2) return;
+        _portalCheckedAt = Clock.NowMs;
 
         var playerPos = _gameState.PlayerGridPos;
         var portal = _gameState.GetTownPortals()
@@ -1395,25 +1035,6 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             run.MapEntryPoint = PortalPoint;
         }
     }
-
-    private void LogAfflictionatorStates(Entity? aff, string context)
-    {
-        try
-        {
-            var states = aff?.GetComponent<StateMachine>()?.States;
-            var dump = states == null
-                ? "n/a"
-                : string.Join(", ", states.Select(s => $"{s.Name}={s.Value}"));
-            _log($"[Simulacrum] {context}. Initiator states: {dump}");
-        }
-        catch
-        {
-            _log($"[Simulacrum] {context}.");
-        }
-    }
-
-    private static double SecondsSince(DateTime t) =>
-        t == DateTime.MinValue ? double.MaxValue : (DateTime.Now - t).TotalSeconds;
 
     private enum SimPhase
     {

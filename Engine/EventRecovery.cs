@@ -116,12 +116,12 @@ public sealed class EventRecovery
     {
         _log("Handling death... waiting for resurrect.");
 
-        var deathHandlingSince = DateTime.Now;
+        var deathHandlingSince = Clock.NowMs;
         while (!ct.IsCancellationRequested && _gameState.IsPlayerDead)
         {
             // Checkpoint resurrection spawns us in the hideout; town does not. Only
             // fall back to any resurrect option if no checkpoint button shows up.
-            var allowFallback = (DateTime.Now - deathHandlingSince).TotalSeconds > 15;
+            var allowFallback = Clock.SecondsSince(deathHandlingSince) > 15;
             await TryClickResurrect(allowFallback, ct);
             await Task.Delay(500, ct);
         }
@@ -190,15 +190,15 @@ public sealed class EventRecovery
                 ? $"Gives up after {maxAttempts} attempts."
                 : "Keeps trying until reconnected."));
 
-        var disconnectedAt = DateTime.Now;
-        var lastEnterAt = DateTime.MinValue;
+        var disconnectedAt = Clock.NowMs;
+        var lastEnterAt = Clock.Never;
         var attempts = 0;
         var nextReminder = TimeSpan.FromMinutes(10);
         var warnedBackground = false;
 
         while (!ct.IsCancellationRequested && !_gameState.IsInGameState)
         {
-            var elapsed = DateTime.Now - disconnectedAt;
+            var elapsed = TimeSpan.FromMilliseconds(Clock.MsSince(disconnectedAt));
 
             // Periodic reminders: after the first alert, webhook silence must
             // MEAN "back in game", not "still stuck". 10m, 30m, then hourly.
@@ -247,7 +247,7 @@ public sealed class EventRecovery
                 _ => 30
             };
 
-            if ((DateTime.Now - lastEnterAt).TotalSeconds >= intervalSeconds)
+            if (Clock.SecondsSince(lastEnterAt) >= intervalSeconds)
             {
                 // Only real presses count as attempts -- time spent waiting for
                 // focus or on loading screens never burns the budget.
@@ -262,7 +262,7 @@ public sealed class EventRecovery
                 }
 
                 attempts++;
-                lastEnterAt = DateTime.Now;
+                lastEnterAt = Clock.NowMs;
                 _log("Still disconnected -- pressing Enter (attempt " +
                      $"{attempts}{(maxAttempts > 0 ? $"/{maxAttempts}" : "")})...");
                 await _input.PressKeyRaw(Keys.Enter, ct);

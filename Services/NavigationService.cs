@@ -43,8 +43,8 @@ public sealed class NavigationService
     private readonly Func<int> _getLookahead;
     private readonly Func<Keys> _getMoveKey;
 
-    private DateTime _lastLogTime = DateTime.MinValue;
-    private readonly Dictionary<string, DateTime> _throttledLogAt = [];
+    private long _lastLogTime = Clock.Never;
+    private readonly Dictionary<string, long> _throttledLogAt = [];
 
     /// <summary>
     /// Per-key 1s log throttle. Walks that end instantly (already arrived, no
@@ -54,9 +54,9 @@ public sealed class NavigationService
     /// </summary>
     private void LogThrottled(string key, string message)
     {
-        if (_throttledLogAt.TryGetValue(key, out var at) && (DateTime.Now - at).TotalSeconds < 1)
+        if (_throttledLogAt.TryGetValue(key, out var at) && Clock.SecondsSince(at) < 1)
             return;
-        _throttledLogAt[key] = DateTime.Now;
+        _throttledLogAt[key] = Clock.NowMs;
         _log(message);
     }
 
@@ -115,7 +115,7 @@ public sealed class NavigationService
                 currentActivePath = updatedPath;
             }, cts.Token);
 
-            var requestedAt = DateTime.Now;
+            var requestedAt = Clock.NowMs;
 
             // No-progress watchdog: while we are actively steering, the character
             // must keep making ground. A stall means stuck geometry OR — the case
@@ -125,7 +125,7 @@ public sealed class NavigationService
             // walk is abandoned so control returns to the engine (whose recovery
             // fires once PoE finally drops the frozen session and flips InGame).
             var lastProgressPos = _gameState.PlayerGridPos;
-            var lastProgressAt = DateTime.Now;
+            var lastProgressAt = Clock.NowMs;
             var sidestepTried = false;
 
             try
@@ -167,7 +167,7 @@ public sealed class NavigationService
                         await SteerTowards(new Vector2(targetNode.X, targetNode.Y), ct, logNode: targetNode.ToString());
                         steered = true;
                     }
-                    else if (!pathArrival && (DateTime.Now - requestedAt).TotalMilliseconds > 700)
+                    else if (!pathArrival && Clock.MsSince(requestedAt) > 700)
                     {
                         // The first path can lag (distance field still building on a
                         // fresh area, terrain not exposed yet). Nudge directly toward
@@ -184,9 +184,9 @@ public sealed class NavigationService
                     if (Vector2.Distance(playerGridPos, lastProgressPos) > 3)
                     {
                         lastProgressPos = playerGridPos;
-                        lastProgressAt = DateTime.Now;
+                        lastProgressAt = Clock.NowMs;
                     }
-                    else if (steered && (DateTime.Now - lastProgressAt).TotalMilliseconds > StallAbortMs)
+                    else if (steered && Clock.MsSince(lastProgressAt) > StallAbortMs)
                     {
                         // One sidestep before giving up: a short walk in a random
                         // walkable direction un-wedges corner geometry (the classic
@@ -205,7 +205,7 @@ public sealed class NavigationService
                         if (unstuck)
                         {
                             lastProgressPos = _gameState.PlayerGridPos;
-                            lastProgressAt = DateTime.Now;
+                            lastProgressAt = Clock.NowMs;
                         }
                         else
                         {
@@ -257,15 +257,8 @@ public sealed class NavigationService
     /// </summary>
     private async SyncTask<bool> TrySidestep(CancellationToken ct)
     {
-        int[][]? terrain;
-        try
-        {
-            terrain = _gameState.Controller.IngameState?.Data?.RawPathfindingData;
-        }
-        catch
-        {
-            terrain = null;
-        }
+        var terrain = SafeRead.Try("nav.terrain",
+            () => _gameState.Controller.IngameState?.Data?.RawPathfindingData);
 
         var start = _gameState.PlayerGridPos;
         var rows = terrain?.Length ?? 0;
@@ -289,8 +282,8 @@ public sealed class NavigationService
 
         if (dest == null) return false;
 
-        var deadline = DateTime.Now.AddMilliseconds(1200);
-        while (DateTime.Now < deadline && !ct.IsCancellationRequested)
+        var deadline = Clock.InMs(1200);
+        while (!Clock.Reached(deadline) && !ct.IsCancellationRequested)
         {
             if (Vector2.Distance(_gameState.PlayerGridPos, start) > SidestepDistance * 0.6f)
                 return true;
@@ -334,10 +327,10 @@ public sealed class NavigationService
             clampedScreenPos.X + windowRect.Left,
             clampedScreenPos.Y + windowRect.Top);
 
-        if (logNode != null && (DateTime.Now - _lastLogTime).TotalMilliseconds > 1000)
+        if (logNode != null && Clock.MsSince(_lastLogTime) > 1000)
         {
             _chatter($"Moving towards {logNode}");
-            _lastLogTime = DateTime.Now;
+            _lastLogTime = Clock.NowMs;
         }
 
         var moveKey = _getMoveKey();

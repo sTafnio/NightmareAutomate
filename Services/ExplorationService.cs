@@ -37,7 +37,7 @@ public sealed class ExplorationService
     /// <summary>Keyed by the area INSTANCE hash, not the name — two instances of a
     /// same-named area (random map layouts) must never share a tour.</summary>
     private uint _builtForAreaHash;
-    private DateTime _builtAt = DateTime.MinValue;
+    private long _builtAt = Clock.Never;
     private IReadOnlyList<Vector2>? _tour;
     private Task<IReadOnlyList<Vector2>>? _buildTask;
     private int _tourIndex;
@@ -103,25 +103,18 @@ public sealed class ExplorationService
         var needsBuild =
             _builtForAreaHash != areaHash ||
             (_buildTask == null && _tour is { Count: 0 } &&
-             (DateTime.Now - _builtAt).TotalSeconds > EmptyTourRetrySeconds);
+             Clock.SecondsSince(_builtAt) > EmptyTourRetrySeconds);
 
         if (needsBuild)
         {
-            int[][]? terrain;
-            try
-            {
-                terrain = _gameState.Controller.IngameState?.Data?.RawPathfindingData;
-            }
-            catch
-            {
-                terrain = null;
-            }
+            var terrain = SafeRead.Try("explore.terrain",
+                () => _gameState.Controller.IngameState?.Data?.RawPathfindingData);
 
             if (terrain == null || terrain.Length == 0)
                 return null;
 
             _builtForAreaHash = areaHash;
-            _builtAt = DateTime.Now;
+            _builtAt = Clock.NowMs;
             _tour = null;
             _tourIndex = 0;
             var seed = _gameState.PlayerGridPos;
@@ -132,7 +125,7 @@ public sealed class ExplorationService
         {
             _tour = _buildTask.Result;
             _buildTask = null;
-            _builtAt = DateTime.Now;
+            _builtAt = Clock.NowMs;
             if (_tour.Count == 0)
                 _log($"[Explore] Tour generation found no open ground in '{_gameState.AreaName}' -- retrying in {EmptyTourRetrySeconds}s.");
             else
@@ -142,7 +135,7 @@ public sealed class ExplorationService
         {
             _log($"[Explore] Tour generation failed: {_buildTask.Exception?.GetBaseException().Message}");
             _buildTask = null;
-            _builtAt = DateTime.Now;
+            _builtAt = Clock.NowMs;
             _tour = []; // empty -> falls into the retry backoff above
         }
 

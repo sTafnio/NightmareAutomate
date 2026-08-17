@@ -291,18 +291,10 @@ public sealed class StashService
     /// First item element in the visible tab whose entity path matches.
     /// </summary>
     private ExileCore.PoEMemory.Elements.InventoryElements.NormalInventoryItem? FindVisibleTabItem(
-        string itemPathFragment)
-    {
-        try
-        {
-            return VisibleStashInventory?.VisibleInventoryItems?
-                .FirstOrDefault(i => i?.Item?.Path != null && i.Item.Path.Contains(itemPathFragment));
-        }
-        catch
-        {
-            return null;
-        }
-    }
+        string itemPathFragment) =>
+        Helpers.SafeRead.Try("stash.visible-tab-item", () =>
+            VisibleStashInventory?.VisibleInventoryItems?
+                .FirstOrDefault(i => i?.Item?.Path != null && i.Item.Path.Contains(itemPathFragment)));
 
     /// <summary>
     /// The main inventory's server-side change counter — bumps whenever the

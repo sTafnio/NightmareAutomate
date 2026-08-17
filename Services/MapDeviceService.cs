@@ -7,6 +7,7 @@ using System.Windows.Forms;
 using ExileCore.PoEMemory;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared;
+using NightmareAutomate.Helpers;
 
 namespace NightmareAutomate.Services;
 
@@ -38,6 +39,7 @@ public sealed class MapDeviceService
     private readonly NavigationService _navigation;
     private readonly InputService _input;
     private readonly ExplorationService _exploration;
+    private readonly AreaMemory _areas;
     private readonly Action<string> _log;
     private readonly Func<Keys> _getInventoryKey;
 
@@ -47,6 +49,7 @@ public sealed class MapDeviceService
         NavigationService navigation,
         InputService input,
         ExplorationService exploration,
+        AreaMemory areas,
         Action<string> log,
         Func<Keys> getInventoryKey)
     {
@@ -55,6 +58,7 @@ public sealed class MapDeviceService
         _navigation = navigation;
         _input = input;
         _exploration = exploration;
+        _areas = areas;
         _log = log;
         _getInventoryKey = getInventoryKey;
     }
@@ -62,26 +66,18 @@ public sealed class MapDeviceService
     /// <summary>Where the device was last seen, per hideout INSTANCE (area hash).
     /// Hideout entities stream out with distance in large hideouts: a character
     /// dropped at the hideout SPAWN (checkpoint resurrect, /hideout from town)
-    /// may not have the device in its entity bubble at all. STATIC so a bot
-    /// restart in the same hideout keeps it; never persisted to disk.</summary>
-    private static uint _deviceAreaHash;
-    private static System.Numerics.Vector2? _devicePointCache;
-
+    /// may not have the device in its entity bubble at all. Held in the
+    /// plugin-owned AreaMemory so a bot restart in the same hideout keeps it;
+    /// never persisted to disk. Only read/written while in the hideout, so the
+    /// current area hash is the hideout's.</summary>
     private System.Numerics.Vector2? LastKnownDevicePoint
     {
-        get { EnsureDevicePointIsForCurrentInstance(); return _devicePointCache; }
-        set { EnsureDevicePointIsForCurrentInstance(); _devicePointCache = value; }
-    }
-
-    private void EnsureDevicePointIsForCurrentInstance()
-    {
-        // Only a DIFFERENT hideout instance invalidates — map runs in between
-        // must not wipe the point.
-        if (!_gameState.IsInHideout) return;
-        var hash = _gameState.AreaHash;
-        if (hash == 0 || hash == _deviceAreaHash) return;
-        _deviceAreaHash = hash;
-        _devicePointCache = null;
+        get => _areas.GetPoint(_gameState.AreaHash, AreaMemory.MapDeviceKey);
+        set
+        {
+            if (value is { } p)
+                _areas.SetPoint(_gameState.AreaHash, AreaMemory.MapDeviceKey, p);
+        }
     }
 
     private Element? AtlasRoot => _gameState.Controller.IngameState?.IngameUi?.Atlas;
@@ -96,21 +92,40 @@ public sealed class MapDeviceService
     /// surfaced in engine webhooks/logs so a stuck flow says WHY remotely.</summary>
     public string? LastFailure { get; private set; }
 
+    /// <summary>Close the inventory panel via its own key (Escape order is
+    /// unreliable with multiple panels up).</summary>
+    private async SyncTask<bool> CloseInventoryPanel(CancellationToken ct)
+    {
+        if (!_inventory.IsInventoryPanelOpen) return true;
+        await _input.PressKey(_getInventoryKey(), ct);
+        return await WaitFor(() => !_inventory.IsInventoryPanelOpen, 1000, ct);
+    }
+
+    /// <summary>Press Escape until the Atlas and every blocking panel are gone.
+    /// Escape is only pressed while something is actually open — with nothing to
+    /// close it brings up the game menu, which would then swallow clicks itself.</summary>
+    private async SyncTask<bool> EscapeUntilClear(int attempts, CancellationToken ct)
+    {
+        for (var i = 0; i < attempts && !ct.IsCancellationRequested; i++)
+        {
+            if (!IsAtlasOpen && !_gameState.HasBlockingUiPanel)
+                return true;
+            await _input.PressKey(Keys.Escape, ct);
+            await Task.Delay(300, ct);
+        }
+
+        return !IsAtlasOpen && !_gameState.HasBlockingUiPanel;
+    }
+
     /// <summary>
     /// Best-effort UI reset between failed flows: the inventory panel is closed
     /// via its own key, then Escape clears whatever else is in the way (Atlas,
     /// device window, reward popups) — the next attempt starts from a clean
-    /// screen instead of clicking into a stale half-open UI. Escape is only
-    /// pressed while something is actually open (with nothing to close it brings
-    /// up the game menu).
+    /// screen instead of clicking into a stale half-open UI.
     /// </summary>
     public async SyncTask<bool> ResetUi(CancellationToken ct)
     {
-        if (_inventory.IsInventoryPanelOpen)
-        {
-            await _input.PressKey(_getInventoryKey(), ct);
-            await WaitFor(() => !_inventory.IsInventoryPanelOpen, 1000, ct);
-        }
+        await CloseInventoryPanel(ct);
 
         // A LOADED map slot with its window still open is the one UI state worth
         // KEEPING between attempts: the retry can click Activate directly, while
@@ -129,15 +144,7 @@ public sealed class MapDeviceService
             if (IsDeviceWindowOpen && !_gameState.HasPopupOpen) return true;
         }
 
-        for (var i = 0; i < 3 && !ct.IsCancellationRequested; i++)
-        {
-            if (!IsAtlasOpen && !_gameState.HasBlockingUiPanel)
-                return true;
-            await _input.PressKey(Keys.Escape, ct);
-            await Task.Delay(300, ct);
-        }
-
-        return !IsAtlasOpen && !_gameState.HasBlockingUiPanel;
+        return await EscapeUntilClear(3, ct);
     }
 
     /// <summary>
@@ -149,21 +156,8 @@ public sealed class MapDeviceService
     /// </summary>
     public async SyncTask<bool> ForceCloseUi(CancellationToken ct)
     {
-        if (_inventory.IsInventoryPanelOpen)
-        {
-            await _input.PressKey(_getInventoryKey(), ct);
-            await WaitFor(() => !_inventory.IsInventoryPanelOpen, 1000, ct);
-        }
-
-        for (var i = 0; i < 4 && !ct.IsCancellationRequested; i++)
-        {
-            if (!IsAtlasOpen && !_gameState.HasBlockingUiPanel)
-                return true;
-            await _input.PressKey(Keys.Escape, ct);
-            await Task.Delay(300, ct);
-        }
-
-        return !IsAtlasOpen && !_gameState.HasBlockingUiPanel;
+        await CloseInventoryPanel(ct);
+        return await EscapeUntilClear(4, ct);
     }
 
     /// <summary>
@@ -222,21 +216,14 @@ public sealed class MapDeviceService
     /// are inside. Server says items + UI shows none = the panel is COLLAPSED
     /// (the game remembers that between sessions) — clicks would hit the atlas
     /// behind it.</summary>
-    private bool StorageItemsClickable()
+    private bool StorageItemsClickable() => SafeRead.Try("device.storage-clickable", () =>
     {
-        try
-        {
-            var ui = UiStorage;
-            if (ui == null || !ui.IsVisible) return false;
-            var serverCount = _inventory.MapDeviceStorage?.InventorySlotItems?.Count ?? 0;
-            if (serverCount == 0) return true; // nothing to click either way
-            return ui.VisibleInventoryItems?.Count > 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+        var ui = UiStorage;
+        if (ui == null || !ui.IsVisible) return false;
+        var serverCount = _inventory.MapDeviceStorage?.InventorySlotItems?.Count ?? 0;
+        if (serverCount == 0) return true; // nothing to click either way
+        return ui.VisibleInventoryItems?.Count > 0;
+    });
 
     /// <summary>
     /// Make the storage panel usable: when the server reports items but the UI
@@ -494,10 +481,10 @@ public sealed class MapDeviceService
                 else if (LastKnownDevicePoint == null)
                 {
                     _log("[MapDevice] Device not in the entity bubble and no remembered spot -- touring the hideout.");
-                    var deadline = DateTime.Now.AddMinutes(2);
+                    var deadline = Clock.InMinutes(2);
                     await _exploration.ExploreUntil(
-                        Helpers.WaitHelpers.Throttle(
-                            () => _gameState.FindMapDevice() != null || DateTime.Now > deadline, 250), ct);
+                        WaitHelpers.Throttle(
+                            () => _gameState.FindMapDevice() != null || Clock.Reached(deadline), 250), ct);
                 }
             }
         }

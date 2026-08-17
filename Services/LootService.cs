@@ -8,6 +8,7 @@ using System.Windows.Forms;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.Elements;
 using ExileCore.Shared;
+using NightmareAutomate.Helpers;
 
 namespace NightmareAutomate.Services;
 
@@ -52,7 +53,7 @@ public sealed class LootService
     /// bubble now (entity id → grid position). Cleared when a new wave starts —
     /// the game destroys ground items then.</summary>
     private readonly Dictionary<uint, Vector2> _rememberedSpots = [];
-    private DateTime _observedAt = DateTime.MinValue;
+    private long _observedAt = Clock.Never;
 
     public LootService(
         GameStateService gameState,
@@ -125,8 +126,8 @@ public sealed class LootService
     /// </summary>
     public void ObserveGroundLoot()
     {
-        if ((DateTime.Now - _observedAt).TotalSeconds < 1) return;
-        _observedAt = DateTime.Now;
+        if (Clock.SecondsSince(_observedAt) < 1) return;
+        _observedAt = Clock.NowMs;
 
         foreach (var l in GetWantedLabels())
             _rememberedSpots[l.Entity.Id] = l.Entity.GridPosNum;
@@ -161,7 +162,7 @@ public sealed class LootService
         var retryRound = 0;
         var sawUnfittable = false;
         var lastChanceDone = false;
-        var emptySince = (DateTime?)null;
+        var emptySince = (long?)null;
 
         while (!ct.IsCancellationRequested)
         {
@@ -225,8 +226,8 @@ public sealed class LootService
                 }
 
                 // Loot trickles in — require a short stable-empty period.
-                emptySince ??= DateTime.Now;
-                if ((DateTime.Now - emptySince.Value).TotalMilliseconds > 700)
+                emptySince ??= Clock.NowMs;
+                if (Clock.MsSince(emptySince.Value) > 700)
                 {
                     if (deferred.Count > 0)
                     {
@@ -371,11 +372,11 @@ public sealed class LootService
             // standing still with the label still up — bail after a short
             // standstill instead of burning the full cap, the failed-click
             // handling below re-clicks immediately.
-            var clickedAt = DateTime.Now;
+            var clickedAt = Clock.NowMs;
             await Helpers.WaitHelpers.For(() =>
                 LabelGone(groundEntity.Id) ||
                 (!_gameState.IsPlayerMoving &&
-                 (DateTime.Now - clickedAt).TotalMilliseconds > 800), 5000, ct);
+                 Clock.MsSince(clickedAt) > 800), 5000, ct);
 
             var picked = LabelGone(groundEntity.Id);
             if (picked)

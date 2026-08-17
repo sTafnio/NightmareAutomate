@@ -43,35 +43,22 @@ public sealed class GemLevelService
     /// A gem popup is ready when its + button is up and no child says the gem
     /// cannot level (that popup variant has no clickable effect).
     /// </summary>
-    private static bool IsReady(GemLevelUpElement gem)
+    private static bool IsReady(GemLevelUpElement gem) => SafeRead.Try("gems.is-ready", () =>
     {
-        try
-        {
-            if (gem is not { IsVisible: true }) return false;
-            if (gem.LevelUpButton is not { IsVisible: true } button || button.Address == 0) return false;
-            return gem.FindChildRecursive(
-                e => e?.Text?.Contains(CannotLevelText, StringComparison.OrdinalIgnoreCase) == true,
-                6, 0) == null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+        if (gem is not { IsVisible: true }) return false;
+        if (gem.LevelUpButton is not { IsVisible: true } button || button.Address == 0) return false;
+        return gem.FindChildRecursive(
+            e => e?.Text?.Contains(CannotLevelText, StringComparison.OrdinalIgnoreCase) == true,
+            6, 0) == null;
+    });
 
-    private IReadOnlyList<GemLevelUpElement> ReadyGems()
-    {
-        try
+    private IReadOnlyList<GemLevelUpElement> ReadyGems() =>
+        SafeRead.Try<IReadOnlyList<GemLevelUpElement>>("gems.ready-list", () =>
         {
             var panel = Panel;
             if (panel is not { IsVisible: true }) return [];
             return panel.GemsToLvlUp?.Where(IsReady).ToList() ?? [];
-        }
-        catch
-        {
-            return [];
-        }
-    }
+        }) ?? [];
 
     public bool HasReadyGems() => ReadyGems().Count > 0;
 

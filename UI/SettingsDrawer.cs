@@ -78,30 +78,34 @@ public class SettingsDrawer
     }
 
     /// <summary>
-    /// Single stash tab picker: combo over the live tab list with a "(none)" entry
-    /// (empty string = feature off). Falls back to a raw text input while the live
-    /// list is unavailable.
+    /// Combo over the live stash-tab list. BeginCombo (not Combo) so a saved
+    /// name missing from the live list (renamed/other league) still shows as the
+    /// preview value. allowNone adds a "(none)" entry mapping to the empty
+    /// string. Returns true when the selection changed (current is updated).
     /// </summary>
-    private string TabPicker(string label, string current, string? help)
+    private static bool TabCombo(
+        string id, System.Collections.Generic.IReadOnlyList<string> tabNames,
+        ref string current, bool allowNone)
     {
-        var tabNames = _s.StashTabNames();
-        if (tabNames.Count == 0)
-            return TextInput(label, current, help);
-
-        current ??= string.Empty;
+        var changed = false;
         ImGui.SetNextItemWidth(ControlWidth);
-        // BeginCombo so a saved name missing from the live list (renamed/other
-        // league) still shows as the preview value.
-        if (ImGui.BeginCombo(label, string.IsNullOrEmpty(current) ? "(none)" : current))
+        if (ImGui.BeginCombo(id, allowNone && string.IsNullOrEmpty(current) ? "(none)" : current))
         {
-            if (ImGui.Selectable("(none)", string.IsNullOrEmpty(current)))
+            if (allowNone && ImGui.Selectable("(none)", string.IsNullOrEmpty(current)) &&
+                !string.IsNullOrEmpty(current))
+            {
                 current = string.Empty;
+                changed = true;
+            }
 
             foreach (var name in tabNames)
             {
                 var isCurrent = name.Equals(current, StringComparison.OrdinalIgnoreCase);
-                if (ImGui.Selectable(name, isCurrent))
+                if (ImGui.Selectable(name, isCurrent) && !isCurrent)
+                {
                     current = name;
+                    changed = true;
+                }
 
                 if (isCurrent)
                     ImGui.SetItemDefaultFocus();
@@ -110,6 +114,21 @@ public class SettingsDrawer
             ImGui.EndCombo();
         }
 
+        return changed;
+    }
+
+    /// <summary>
+    /// Single stash tab picker with a "(none)" entry (empty string = feature
+    /// off). Falls back to a raw text input while the live list is unavailable.
+    /// </summary>
+    private string TabPicker(string label, string current, string? help)
+    {
+        var tabNames = _s.StashTabNames();
+        if (tabNames.Count == 0)
+            return TextInput(label, current, help);
+
+        current ??= string.Empty;
+        TabCombo(label, tabNames, ref current, allowNone: true);
         HelpMarker(help);
         return current;
     }
@@ -142,25 +161,11 @@ public class SettingsDrawer
             ImGui.PushID(i);
             ImGui.TextUnformatted($"Tab {i + 1}");
             ImGui.SameLine(90);
-            ImGui.SetNextItemWidth(ControlWidth);
-            // BeginCombo instead of Combo so a saved name missing from the live
-            // list (renamed/other league) still shows as the preview value.
-            if (ImGui.BeginCombo("##dumptab", selected[i]))
+            var rowValue = selected[i];
+            if (TabCombo("##dumptab", tabNames, ref rowValue, allowNone: false))
             {
-                foreach (var name in tabNames)
-                {
-                    var isCurrent = name.Equals(selected[i], StringComparison.OrdinalIgnoreCase);
-                    if (ImGui.Selectable(name, isCurrent) && !isCurrent)
-                    {
-                        selected[i] = name;
-                        changed = true;
-                    }
-
-                    if (isCurrent)
-                        ImGui.SetItemDefaultFocus();
-                }
-
-                ImGui.EndCombo();
+                selected[i] = rowValue;
+                changed = true;
             }
 
             ImGui.SameLine();

@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 using ExileCore.Shared;
 using NightmareAutomate.Enums;
+using NightmareAutomate.Helpers;
 using NightmareAutomate.Models;
 using NightmareAutomate.Services;
 using NightmareAutomate.Strategies;
@@ -43,42 +45,43 @@ public sealed class FarmingEngine
     private readonly IFarmStrategy _strategy;
     private readonly NavigationService _navigation;
     private readonly GameStateService _gameState;
+    private readonly InputService _input;
     private readonly MapDeviceService _mapDevice;
     private readonly ChoresService _chores;
     private readonly EventRecovery _recovery;
     private readonly DiscordWebhookService _webhook;
     private readonly SessionStats _stats;
-    private readonly Services.ExplorationService _exploration;
+    private readonly ExplorationService _exploration;
+    private readonly AreaMemory _areas;
     private readonly Action<string> _log;
     private readonly Func<int> _getMaxRuns;
 
     private bool _noReturnPortalNotified;
 
-    private DateTime _portalWaitStartedAt = DateTime.MinValue;
+    private long _portalWaitStartedAt = Clock.Never;
 
     private int _stashFailuresInARow;
-    private DateTime _stashBackoffUntil = DateTime.MinValue;
+    private long _stashBackoffUntil; // 0 = no backoff (monotonic deadline)
     private int _stashBackoffLevel;
     private bool _stashTroubleNotified;
     private int _restockRetries;
     private int _mapDeviceFailuresInARow;
     private bool _mapDeviceTroubleNotified;
 
+    // Stray-panel watchdog (in-map): Escape presses are throttled, and only a
+    // panel that survives several of them is worth a webhook.
+    private long _strayPanelEscapeAt = Clock.Never;
+    private int _strayPanelEscapes;
+    private bool _strayPanelNotified;
+
     // Notification bookkeeping: per-run values are deltas against these
     // snapshots (taken whenever a run starts or is adopted).
-    private DateTime _sessionStartedAt = DateTime.Now;
+    private long _sessionStartedAt = Clock.NowMs;
     private int _sessionStartDeaths;
-    private DateTime _runStartedAt = DateTime.Now;
+    private long _runStartedAt = Clock.NowMs;
     private int _runStartDeaths;
     private int _runStartGems;
     private string _finishReason = "";
-
-    /// <summary>After a run completes, its leftover portals still stand at the map
-    /// device -- they must not be re-adopted (entering once to determine "completed"
-    /// is enough). Cleared when a fresh map is activated. STATIC on purpose: the
-    /// engine is recreated on every bot start, and a restart right after a completed
-    /// run must not re-adopt that run's leftovers either.</summary>
-    private static bool _ignoreExistingPortals;
 
     public BotState CurrentState { get; private set; } = BotState.Idle;
     public IFarmStrategy Strategy => _strategy;
@@ -113,26 +116,21 @@ public sealed class FarmingEngine
 
     public FarmingEngine(
         IFarmStrategy strategy,
-        NavigationService navigation,
-        GameStateService gameState,
-        MapDeviceService mapDevice,
-        ChoresService chores,
-        EventRecovery recovery,
-        DiscordWebhookService webhook,
-        SessionStats stats,
-        Services.ExplorationService exploration,
+        BotServices services,
         Action<string> log,
         Func<int> getMaxRuns)
     {
         _strategy = strategy;
-        _navigation = navigation;
-        _gameState = gameState;
-        _mapDevice = mapDevice;
-        _chores = chores;
-        _recovery = recovery;
-        _webhook = webhook;
-        _stats = stats;
-        _exploration = exploration;
+        _navigation = services.Navigation;
+        _gameState = services.GameState;
+        _input = services.Input;
+        _mapDevice = services.MapDevice;
+        _chores = services.Chores;
+        _recovery = services.Recovery;
+        _webhook = services.Webhook;
+        _stats = services.Stats;
+        _exploration = services.Exploration;
+        _areas = services.Areas;
         _log = log;
         _getMaxRuns = getMaxRuns;
     }
@@ -144,7 +142,7 @@ public sealed class FarmingEngine
     {
         try
         {
-            _sessionStartedAt = DateTime.Now;
+            _sessionStartedAt = Clock.NowMs;
             _sessionStartDeaths = _stats.Deaths;
             _strategy.Reset();
             CurrentState = DetectInitialState();
@@ -222,8 +220,11 @@ public sealed class FarmingEngine
         catch (OperationCanceledException) { /* Clean shutdown */ }
         catch (Exception ex)
         {
-            _log($"CRITICAL ENGINE FATAL: {ex.Message}");
-            _webhook.NotifyCritical("Bot error", $"Engine crashed: {ex.Message}");
+            // Full ToString: an overnight "Object reference not set" without the
+            // stack is undiagnosable — the stack IS the diagnosis.
+            _log($"CRITICAL ENGINE FATAL: {ex}");
+            _webhook.NotifyCritical("Bot error",
+                $"Engine crashed: {ex.GetType().Name}: {ex.Message} (full stack in Logs\\Info*.log)");
             CurrentState = BotState.Error;
             return false;
         }
@@ -249,7 +250,7 @@ public sealed class FarmingEngine
     /// </summary>
     private void BeginRunTracking()
     {
-        _runStartedAt = DateTime.Now;
+        _runStartedAt = Clock.NowMs;
         _runStartDeaths = _stats.Deaths;
         _runStartGems = _stats.GemsLeveled;
     }
@@ -262,7 +263,7 @@ public sealed class FarmingEngine
         var lines = new List<string>();
         foreach (var (label, value) in _strategy.GetStatusRows(Context))
             lines.Add($"{label}: {value}");
-        lines.Add($"Duration: {FormatDuration(DateTime.Now - _runStartedAt)}");
+        lines.Add($"Duration: {FormatDuration(TimeSpan.FromMilliseconds(Clock.MsSince(_runStartedAt)))}");
         lines.Add($"Deaths: {_stats.Deaths - _runStartDeaths}");
         lines.Add($"Portals used: {Context.PortalsUsed}/{RunContext.MaxPortals}");
         lines.Add($"Gems leveled: {_stats.GemsLeveled - _runStartGems}");
@@ -275,7 +276,7 @@ public sealed class FarmingEngine
 
     private void SendSessionSummary()
     {
-        var elapsed = DateTime.Now - _sessionStartedAt;
+        var elapsed = TimeSpan.FromMilliseconds(Clock.MsSince(_sessionStartedAt));
         var runsPerHour = elapsed.TotalHours > 0 ? Context.RunsCompleted / elapsed.TotalHours : 0;
         var lines = new List<string>
         {
@@ -344,6 +345,26 @@ public sealed class FarmingEngine
         return true;
     }
 
+    /// <summary>
+    /// A standing tab-settings problem WITH a full inventory: the config latch
+    /// keeps the stash chores off (retrying can't fix a wrong tab name), but
+    /// farming on in this state means no loot gets picked — stop loudly
+    /// instead. (The latch lifts on its own when the settings change.)
+    /// Null when the inventory still has room (farming on is acceptable).
+    /// </summary>
+    private BotState? StopForConfigErrorWithFullInventory()
+    {
+        if (!_chores.UrgentStashPending) return null;
+
+        var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
+        _log($"Stash settings problem with a FULL inventory -- stopping. {detail}");
+        _webhook.NotifyCritical("Stash settings problem",
+            $"{detail} The inventory is full, so farming on cannot pick loot -- session stopped. " +
+            "Fix the tab settings and restart.");
+        _finishReason = "Stash settings problem with a full inventory.";
+        return BotState.Finished;
+    }
+
     private BotState DoInHideout()
     {
         // Standing inside the farm area means an entry went unconfirmed -- no
@@ -355,7 +376,7 @@ public sealed class FarmingEngine
         // adopt them instead of consuming a fresh fragment. Used count is inferred
         // from how many of the 6 portals remain. Skipped when they belong to a run
         // we just completed -- those lead back into a finished map.
-        if (!Context.RunActive && !_ignoreExistingPortals)
+        if (!Context.RunActive && !_areas.IgnorePortalsOfCompletedRun)
         {
             var existing = _gameState.FindFarmPortals(_strategy.IsFarmArea);
             if (existing.Count > 0)
@@ -374,7 +395,7 @@ public sealed class FarmingEngine
             if (Context.PortalsRemaining > 0)
             {
                 _log($"Run still active, {Context.PortalsRemaining} portals left. Re-entering.");
-                _portalWaitStartedAt = DateTime.Now;
+                _portalWaitStartedAt = Clock.NowMs;
                 return BotState.WaitingForPortal;
             }
 
@@ -383,25 +404,14 @@ public sealed class FarmingEngine
             Context.RunActive = false;
         }
 
-        // A standing tab-settings problem WITH a full inventory: the config latch
-        // keeps the stash chores off (retrying can't fix a wrong tab name), but
-        // farming on in this state means no loot gets picked — stop loudly
-        // instead. (The latch lifts on its own when the settings change.)
-        if (_chores.ConfigErrorStanding && _chores.UrgentStashPending)
-        {
-            var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
-            _log($"Stash settings problem with a FULL inventory -- stopping. {detail}");
-            _webhook.NotifyCritical("Stash settings problem",
-                $"{detail} The inventory is full, so farming on cannot pick loot -- session stopped. " +
-                "Fix the tab settings and restart.");
-            _finishReason = "Stash settings problem with a full inventory.";
-            return BotState.Finished;
-        }
+        if (_chores.ConfigErrorStanding && StopForConfigErrorWithFullInventory() is { } stop)
+            return stop;
 
         // Chores (stash dump, gem level-ups, fragment restock) that
         // keep failing must not loop the InHideout<->Stashing states forever --
         // back off (escalating) and farm on.
-        if (DateTime.Now >= _stashBackoffUntil && _chores.HasPending(_strategy.MapDeviceItemPaths))
+        if (Clock.Reached(_stashBackoffUntil) &&
+            _chores.HasPending(_strategy.MapDeviceItemPaths, _strategy.RestockTabName))
             return BotState.Stashing;
 
         var maxRuns = _getMaxRuns();
@@ -418,7 +428,7 @@ public sealed class FarmingEngine
     private async SyncTask<BotState> DoStashing(CancellationToken ct)
     {
         _log("Running hideout chores (stash / gems / fragments)...");
-        var result = await _chores.Run(_strategy.MapDeviceItemPaths, ct);
+        var result = await _chores.Run(_strategy.MapDeviceItemPaths, _strategy.RestockTabName, ct);
         switch (result)
         {
             case ChoresResult.OutOfFragments:
@@ -440,17 +450,10 @@ public sealed class FarmingEngine
                 // FULL inventory even farming on is pointless: loot can no longer
                 // be picked, so stop the session instead.
                 _stashFailuresInARow = 0;
-                var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
-                if (_chores.UrgentStashPending)
-                {
-                    _log($"Stash settings problem with a FULL inventory -- stopping. {detail}");
-                    _webhook.NotifyCritical("Stash settings problem",
-                        $"{detail} The inventory is full, so farming on cannot pick loot -- session stopped. " +
-                        "Fix the tab settings and restart.");
-                    _finishReason = "Stash settings problem with a full inventory.";
-                    return BotState.Finished;
-                }
+                if (StopForConfigErrorWithFullInventory() is { } stop)
+                    return stop;
 
+                var detail = _chores.LastFailureDetail ?? "A configured stash tab was not found.";
                 _log($"Chores blocked by a settings problem -- {detail} Paused until the settings change.");
                 _webhook.NotifyCritical("Stash settings problem",
                     $"{detail} Stashing is paused until the settings change -- retrying cannot fix a wrong tab name.");
@@ -506,7 +509,7 @@ public sealed class FarmingEngine
                 var backoffSeconds = StashBackoffSeconds[Math.Min(_stashBackoffLevel, StashBackoffSeconds.Length - 1)];
                 _stashBackoffLevel++;
                 _stashFailuresInARow = 0;
-                _stashBackoffUntil = DateTime.Now.AddSeconds(backoffSeconds);
+                _stashBackoffUntil = Clock.InSeconds(backoffSeconds);
                 _log($"Chores failed {MaxStashFailures}x in a row ({detail}) -- backing off for {backoffSeconds}s.");
                 if (!_stashTroubleNotified)
                 {
@@ -528,7 +531,7 @@ public sealed class FarmingEngine
         if (_strategy.MapDeviceItemPaths.Count == 0)
         {
             // Legacy strategies: portals appear without our involvement.
-            _portalWaitStartedAt = DateTime.Now;
+            _portalWaitStartedAt = Clock.NowMs;
             return BotState.WaitingForPortal;
         }
 
@@ -545,8 +548,8 @@ public sealed class FarmingEngine
                 _restockRetries = 0;
                 _mapDeviceFailuresInARow = 0;
                 _mapDeviceTroubleNotified = false;
-                _ignoreExistingPortals = false; // fresh portals from here on
-                _portalWaitStartedAt = DateTime.Now;
+                _areas.IgnorePortalsOfCompletedRun = false; // fresh portals from here on
+                _portalWaitStartedAt = Clock.NowMs;
                 return BotState.WaitingForPortal;
 
             case MapDeviceResult.NoFragments:
@@ -556,12 +559,12 @@ public sealed class FarmingEngine
                 // chores another (bounded) chance instead of ending the session
                 // on a false "out of fragments". The true tab-empty signal is
                 // ChoresResult.OutOfFragments, handled in DoStashing.
-                if (_chores.CanRestock(_strategy.MapDeviceItemPaths))
+                if (_chores.CanRestock(_strategy.MapDeviceItemPaths, _strategy.RestockTabName))
                 {
                     if (_restockRetries < MaxRestockRetries)
                     {
                         _restockRetries++;
-                        _stashBackoffUntil = DateTime.MinValue;
+                        _stashBackoffUntil = 0;
                         _log($"No fragments on hand -- retrying the stash restock ({_restockRetries}/{MaxRestockRetries}).");
                         await Task.Delay(2000, ct);
                         return BotState.InHideout;
@@ -649,12 +652,12 @@ public sealed class FarmingEngine
         if (portals.Count > 0)
             return BotState.EnteringMap;
 
-        if (_portalWaitStartedAt == DateTime.MinValue)
-            _portalWaitStartedAt = DateTime.Now;
+        if (_portalWaitStartedAt == Clock.Never)
+            _portalWaitStartedAt = Clock.NowMs;
 
-        if ((DateTime.Now - _portalWaitStartedAt).TotalSeconds > 15)
+        if (Clock.SecondsSince(_portalWaitStartedAt) > 15)
         {
-            _portalWaitStartedAt = DateTime.MinValue;
+            _portalWaitStartedAt = Clock.Never;
             if (Context.RunActive && Context.PortalsUsed > 0)
             {
                 _log("No portals found for re-entry -- run lost.");
@@ -673,7 +676,7 @@ public sealed class FarmingEngine
         var portals = _gameState.FindFarmPortals(_strategy.IsFarmArea);
         if (portals.Count == 0)
         {
-            _portalWaitStartedAt = DateTime.Now;
+            _portalWaitStartedAt = Clock.NowMs;
             return BotState.WaitingForPortal;
         }
 
@@ -723,6 +726,51 @@ public sealed class FarmingEngine
             return BotState.ReturningToHideout;
         }
 
+        // Stray-panel watchdog: a panel the bot never wants (MTX shop, passive
+        // tree, ...) opened by a stray click/keypress swallows every hover and
+        // click — left alone it stalls the run silently until the abandon timer.
+        // Escape it here, before the strategy runs, throttled so a panel that
+        // refuses to close cannot turn the loop into an Escape spammer.
+        var strayPanelOpen = _gameState.HasStrayPanelOpen;
+        if (strayPanelOpen)
+        {
+            if (Clock.SecondsSince(_strayPanelEscapeAt) > 3)
+            {
+                _strayPanelEscapeAt = Clock.NowMs;
+                _strayPanelEscapes++;
+                _log($"A stray panel (MTX shop / tree / map / social) is open -- pressing Escape to close it (attempt {_strayPanelEscapes}).");
+                await _navigation.ReleaseMoveKey();
+                await _input.PressKey(Keys.Escape, ct);
+
+                // Escape not working means something INSIDE the panel holds focus
+                // (e.g. a purchase-confirmation dialog) -- that must be visible in
+                // Discord, not silently retried all night.
+                if (_strayPanelEscapes >= 5 && !_strayPanelNotified)
+                {
+                    _strayPanelNotified = true;
+                    _webhook.NotifyCritical("Stray panel will not close",
+                        $"A panel (MTX shop / tree / map / social) is open in the map and {_strayPanelEscapes} " +
+                        "Escape presses have not closed it. The bot keeps trying, but may need a hand.");
+                }
+            }
+
+            // The panel owns the screen -- running the strategy under it would
+            // just feed clicks into it (and could confirm a shop dialog). But
+            // only hold the strategy back while Escape still has a chance:
+            // past 10 failed presses, fall through so the strategy's abandon
+            // timer keeps owning the endgame instead of looping here forever.
+            if (_strayPanelEscapes < 10)
+                return BotState.RunningFarm;
+        }
+
+        if (!strayPanelOpen && _strayPanelEscapes > 0 && Clock.SecondsSince(_strayPanelEscapeAt) > 3)
+        {
+            if (_strayPanelEscapes >= 5)
+                _webhook.NotifyCritical("Stray panel closed", "The stuck panel is gone -- resuming the run.");
+            _strayPanelEscapes = 0;
+            _strayPanelNotified = false;
+        }
+
         bool farmComplete = await _strategy.ExecuteFarm(Context, ct);
 
         if (farmComplete)
@@ -730,7 +778,7 @@ public sealed class FarmingEngine
             _log("Farm objective complete!");
             Context.RunActive = false;
             Context.RunsCompleted++;
-            _ignoreExistingPortals = true; // leftovers lead into the finished map
+            _areas.IgnorePortalsOfCompletedRun = true; // leftovers lead into the finished map
             SendRunSummary();
             return BotState.ReturningToHideout;
         }
@@ -795,10 +843,10 @@ public sealed class FarmingEngine
                 await Task.Delay(1000, ct);
 
             _log("No portal in sight -- exploring the area to find one.");
-            var deadline = DateTime.Now.AddMinutes(3);
+            var deadline = Clock.InMinutes(3);
             await _exploration.ExploreUntil(
-                Helpers.WaitHelpers.Throttle(
-                    () => _gameState.GetTownPortals().Count > 0 || DateTime.Now > deadline, 250), ct);
+                WaitHelpers.Throttle(
+                    () => _gameState.GetTownPortals().Count > 0 || Clock.Reached(deadline), 250), ct);
 
             if (_gameState.GetTownPortals().Count == 0 && !_noReturnPortalNotified)
             {
@@ -829,15 +877,15 @@ public sealed class FarmingEngine
     private async SyncTask<bool> WaitForAreaTransition(
         Func<bool> arrived, int timeoutSeconds, CancellationToken ct)
     {
-        var deadline = DateTime.Now.AddSeconds(timeoutSeconds);
-        var hardCap = DateTime.Now.AddMinutes(2);
-        while (DateTime.Now < deadline && !ct.IsCancellationRequested)
+        var deadline = Clock.InSeconds(timeoutSeconds);
+        var hardCap = Clock.InMinutes(2);
+        while (!Clock.Reached(deadline) && !ct.IsCancellationRequested)
         {
             await TaskUtils.NextFrame();
             if (_gameState.IsLoading)
             {
-                if (DateTime.Now < hardCap)
-                    deadline = DateTime.Now.AddSeconds(timeoutSeconds);
+                if (!Clock.Reached(hardCap))
+                    deadline = Clock.InSeconds(timeoutSeconds);
                 continue;
             }
 

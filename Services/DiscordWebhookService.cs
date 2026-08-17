@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
+using NightmareAutomate.Helpers;
 
 namespace NightmareAutomate.Services;
 
@@ -41,7 +42,7 @@ public sealed class DiscordWebhookService : IDisposable
     private readonly object _workerLock = new();
     private Task? _worker;
     private int _consecutiveFailures;
-    private DateTime _disabledUntil = DateTime.MinValue;
+    private long _disabledUntil; // 0 = not paused (monotonic deadline)
 
     public DiscordWebhookService(NightmareAutomateSettings settings, Action<string> log)
     {
@@ -73,7 +74,7 @@ public sealed class DiscordWebhookService : IDisposable
             return;
         }
 
-        _disabledUntil = DateTime.MinValue;
+        _disabledUntil = 0;
         _consecutiveFailures = 0;
         _log("[Discord] Sending a test message...");
         Enqueue("Test notification", "Nightmare Automate can reach this channel.", ColorTest, mention: false);
@@ -82,7 +83,7 @@ public sealed class DiscordWebhookService : IDisposable
     private void Enqueue(string title, string description, int color, bool mention)
     {
         if (string.IsNullOrWhiteSpace(_settings.DiscordWebhookUrl)) return;
-        if (DateTime.Now < _disabledUntil) return;
+        if (!Clock.Reached(_disabledUntil)) return;
 
         _queue.Enqueue(new QueuedEmbed(title, description, color, mention, DateTime.Now));
         EnsureWorker();
@@ -105,7 +106,7 @@ public sealed class DiscordWebhookService : IDisposable
     {
         try
         {
-            var idleSince = DateTime.Now;
+            var idleSince = Clock.NowMs;
             while (!_cts.IsCancellationRequested)
             {
                 var batch = new List<QueuedEmbed>();
@@ -114,12 +115,12 @@ public sealed class DiscordWebhookService : IDisposable
 
                 if (batch.Count == 0)
                 {
-                    if ((DateTime.Now - idleSince).TotalSeconds > 30) return;
+                    if (Clock.SecondsSince(idleSince) > 30) return;
                     await Task.Delay(250, _cts.Token);
                     continue;
                 }
 
-                idleSince = DateTime.Now;
+                idleSince = Clock.NowMs;
                 await PostBatch(batch);
                 await Task.Delay(PostSpacingMs, _cts.Token);
             }
@@ -189,7 +190,7 @@ public sealed class DiscordWebhookService : IDisposable
         if (++_consecutiveFailures >= MaxConsecutiveFailures)
         {
             _consecutiveFailures = 0;
-            _disabledUntil = DateTime.Now.AddMinutes(10);
+            _disabledUntil = Clock.InMinutes(10);
             _queue.Clear();
             _log("[Discord] Notifications paused for 10 minutes after repeated failures -- check the webhook URL.");
         }

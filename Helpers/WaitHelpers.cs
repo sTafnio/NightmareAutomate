@@ -28,13 +28,13 @@ public static class WaitHelpers
     /// </summary>
     public static Func<bool> Throttle(Func<bool> condition, int intervalMs)
     {
-        var lastCheck = DateTime.MinValue;
+        var lastCheck = Clock.Never;
         var lastResult = false;
         return () =>
         {
-            if ((DateTime.Now - lastCheck).TotalMilliseconds < intervalMs)
+            if (Clock.MsSince(lastCheck) < intervalMs)
                 return lastResult;
-            lastCheck = DateTime.Now;
+            lastCheck = Clock.NowMs;
             lastResult = condition();
             return lastResult;
         };

@@ -6,6 +6,7 @@ using ExileCore;
 using ExileCore.Shared;
 using NightmareAutomate.Engine;
 using NightmareAutomate.Enums;
+using NightmareAutomate.Helpers;
 using NightmareAutomate.Services;
 using NightmareAutomate.Strategies;
 using NightmareAutomate.UI;
@@ -17,25 +18,13 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     private CancellationTokenSource? _cts;
     private SyncTask<bool>? _currentTask;
 
-    // Services
-    private GameStateService _gameState = null!;
-    private GridPathfinder _pathfinding = null!;
-    private InputService _input = null!;
-    private InventoryService _inventory = null!;
-    private NavigationService _navigation = null!;
-    private MapDeviceService _mapDevice = null!;
-    private LootService _lootService = null!;
-    private StashService _stashService = null!;
-
-    private ExplorationService _exploration = null!;
-    private GemLevelService _gems = null!;
-    private ChoresService _chores = null!;
-    private DiscordWebhookService _webhook = null!;
-    private Models.SessionStats _stats = null!;
+    /// <summary>Everything the engine and strategies consume, built once in
+    /// Initialise. Individual services the plugin itself touches are reached
+    /// through this bundle too.</summary>
+    private BotServices _services = null!;
 
     // Engine
     private FarmingEngine? _engine;
-    private EventRecovery _recovery = null!;
 
     // UI
     private DebugOverlay _overlay = null!;
@@ -56,84 +45,92 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     public override bool Initialise()
     {
         Name = "Nightmare Automate";
-        
+
         // Keep ticking while OUT of game: ExileCore skips plugins entirely when
         // GameController.InGame is false unless Force is set. Without it the
         // SyncTask pump freezes on disconnect and login recovery can never run.
         Force = true;
 
+        // Counted diagnostics for failed game-memory reads (file log only —
+        // routine hiccups must not spam the overlay).
+        SafeRead.Log = msg => LogMessage($"[NightmareAutomate] {msg}");
+
         // UI overlay (created first so services can log to it)
         _overlay = new DebugOverlay();
 
         // Create services
-        _gameState = new GameStateService(GameController);
-        _pathfinding = new GridPathfinder(GameController);
-        _input = new InputService(GameController, Name);
-        _inventory = new InventoryService(GameController);
+        var areas = new AreaMemory();
+        var gameState = new GameStateService(GameController);
+        var pathfinding = new GridPathfinder(GameController);
+        var input = new InputService(GameController, Name);
+        var inventory = new InventoryService(GameController);
 
-        _navigation = new NavigationService(
-            _gameState,
-            _pathfinding,
-            _input,
+        var navigation = new NavigationService(
+            gameState,
+            pathfinding,
+            input,
             LogInfo,
             msg => _overlay.Log(msg), // steering chatter: overlay only, never the file
             () => Settings.PathLookahead,
             () => Settings.MoveKey.Value.Key);
 
-        _lootService = new LootService(
-            _gameState,
-            _inventory,
-            _navigation,
-            _input,
+        var loot = new LootService(
+            gameState,
+            inventory,
+            navigation,
+            input,
             LogInfo,
             () => Settings.ToggleLabelsKey.Value.Key);
 
-        _exploration = new ExplorationService(_gameState, _navigation, LogInfo);
+        var exploration = new ExplorationService(gameState, navigation, LogInfo);
 
-        _mapDevice = new MapDeviceService(
-            _gameState,
-            _inventory,
-            _navigation,
-            _input,
-            _exploration,
+        var mapDevice = new MapDeviceService(
+            gameState,
+            inventory,
+            navigation,
+            input,
+            exploration,
+            areas,
             LogInfo,
             () => Settings.InventoryKey.Value.Key);
 
-        _stashService = new StashService(
-            _gameState,
-            _inventory,
-            _navigation,
-            _input,
+        var stash = new StashService(
+            gameState,
+            inventory,
+            navigation,
+            input,
             LogInfo,
             () => Settings.DumpTabNames);
 
-        // Must exist BEFORE EventRecovery below -- the constructor captures the
-        // field VALUE, so a later assignment would leave recovery with null.
-        _webhook = new DiscordWebhookService(Settings, LogInfo);
-        Settings.SendTestNotification = () => _webhook.SendTest();
-        Settings.DumpAtlasUi = () => _mapDevice.DumpAtlasUiTree("manual dump from settings");
+        var webhook = new DiscordWebhookService(Settings, LogInfo);
+        Settings.SendTestNotification = () => webhook.SendTest();
+        Settings.DumpAtlasUi = () => mapDevice.DumpAtlasUiTree("manual dump from settings");
 
-        _recovery = new EventRecovery(
-            _gameState,
-            _input,
-            _webhook,
+        var recovery = new EventRecovery(
+            gameState,
+            input,
+            webhook,
             LogInfo,
             () => Settings.HideoutKey.Value.Key,
             () => Settings.MaxReconnectAttempts);
 
-        _stats = new Models.SessionStats();
+        var stats = new Models.SessionStats();
 
-        _gems = new GemLevelService(_gameState, _input, _stats, LogInfo);
+        var gems = new GemLevelService(gameState, input, stats, LogInfo);
 
-        _chores = new ChoresService(
-            _stashService,
-            _gems,
-            _inventory,
+        var chores = new ChoresService(
+            stash,
+            gems,
+            inventory,
             Settings,
             LogInfo);
 
+        _services = new BotServices(
+            gameState, input, inventory, navigation, mapDevice, loot, stash,
+            exploration, gems, chores, recovery, webhook, stats, areas);
+
         // The dump-tab picker in the settings UI needs live stash tab names.
-        Settings.StashTabNames = () => _gameState.GetStashTabNames();
+        Settings.StashTabNames = () => gameState.GetStashTabNames();
 
         // Register hotkeys
         Input.RegisterKey(Settings.ToggleButton.Value.Key);
@@ -153,7 +150,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
         };
 
         // Log service availability
-        if (!_input.IsAvailable)
+        if (!input.IsAvailable)
             LogError("InputHumanizer bridge is not available.");
 
         return true;
@@ -198,7 +195,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
         var state = _engine?.CurrentState ?? BotState.Idle;
         var strategyName = _engine?.Strategy.Name ?? "-";
         var phaseName = _engine?.Strategy.CurrentPhaseName ?? "-";
-        var playerPos = _gameState.PlayerGridPos;
+        var playerPos = _services.GameState.PlayerGridPos;
 
         List<(string, string)>? extraRows = null;
         if (_engine != null)
@@ -220,7 +217,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
         _cts?.Cancel();
         if (_currentTask != null)
             ForceReleaseHeldKeys();
-        _webhook?.Dispose();
+        _services?.Webhook.Dispose();
     }
 
     private void Start()
@@ -239,14 +236,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
 
             _engine = new FarmingEngine(
                 strategy,
-                _navigation,
-                _gameState,
-                _mapDevice,
-                _chores,
-                _recovery,
-                _webhook,
-                _stats,
-                _exploration,
+                _services,
                 LogInfo,
                 () => Settings.MaxRuns);
 
@@ -304,9 +294,7 @@ public class NightmareAutomate : BaseSettingsPlugin<NightmareAutomateSettings>
     {
         return Settings.FarmType switch
         {
-            FarmType.Simulacrum => new SimulacrumStrategy(
-                _navigation, _gameState, _lootService, _inventory, _stashService,
-                _exploration, _input, _gems, Settings, LogInfo),
+            FarmType.Simulacrum => new SimulacrumStrategy(_services, Settings, LogInfo),
 
             _ => null
         };

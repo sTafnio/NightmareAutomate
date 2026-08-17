@@ -5,6 +5,7 @@ using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
+using NightmareAutomate.Helpers;
 using SharpDX;
 
 namespace NightmareAutomate.Services;
@@ -37,56 +38,25 @@ public sealed class GameStateService(GameController gc)
     /// "we were disconnected" signal. Read straight off the game-state machine:
     /// InGame/IsLoading are host-maintained caches whose values on those screens
     /// are not contractual, so recovery must not depend on them alone.</summary>
-    public bool IsAtLoginScreen
+    public bool IsAtLoginScreen => SafeRead.Try("gs.login-screen", () =>
     {
-        get
-        {
-            try
-            {
-                var game = _gc.Game;
-                return game.IsLoginState || game.IsSelectCharacterState;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-    }
+        var game = _gc.Game;
+        return game.IsLoginState || game.IsSelectCharacterState;
+    });
 
     /// <summary>An InGameState is active on the game-state machine — the relogin
     /// loop's exit signal (same condition the proven Automate relogin uses).
     /// True before the world is fully streamed in; gate actions on IsReady.</summary>
-    public bool IsInGameState
-    {
-        get
-        {
-            try { return _gc.Game.IsInGameState; }
-            catch { return false; }
-        }
-    }
+    public bool IsInGameState => SafeRead.Try("gs.ingame-state", () => _gc.Game.IsInGameState);
 
     /// <summary>An area-loading screen is active on the game-state machine
     /// (login -> world, or between areas). Distinct from IsLoading, which is the
     /// host's cached view and unreliable outside a session.</summary>
-    public bool IsLoadingState
-    {
-        get
-        {
-            try { return _gc.Game.IsLoadingState; }
-            catch { return false; }
-        }
-    }
+    public bool IsLoadingState => SafeRead.Try("gs.loading-state", () => _gc.Game.IsLoadingState);
 
     /// <summary>Whether the game window has OS focus — inputs only reach the game
     /// then (relevant for login-screen recovery, where nothing gates on InGame).</summary>
-    public bool IsWindowForeground
-    {
-        get
-        {
-            try { return _gc.Window.IsForeground(); }
-            catch { return false; }
-        }
-    }
+    public bool IsWindowForeground => SafeRead.Try("gs.window-foreground", () => _gc.Window.IsForeground());
 
     /// <summary>
     /// Whether a click-swallowing UI panel is open: any visible fullscreen/large
@@ -94,27 +64,36 @@ public sealed class GameStateService(GameController gc)
     /// dialogs). Used to decide whether pressing Escape would CLOSE something —
     /// Escape with nothing open brings up the game menu instead.
     /// </summary>
-    public bool HasBlockingUiPanel
+    public bool HasBlockingUiPanel => SafeRead.Try("gs.blocking-panel", () =>
     {
-        get
-        {
-            try
-            {
-                var ui = _gc.IngameState?.IngameUi;
-                if (ui == null) return false;
-                if (ui.PopUpWindow?.IsVisible == true) return true;
-                if (ui.FullscreenPanels?.Any(p => p?.IsVisible == true) == true) return true;
-                if (ui.LargePanels?.Any(p => p?.IsVisible == true) == true) return true;
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-    }
+        var ui = _gc.IngameState?.IngameUi;
+        if (ui == null) return false;
+        if (ui.PopUpWindow?.IsVisible == true) return true;
+        if (ui.FullscreenPanels?.Any(p => p?.IsVisible == true) == true) return true;
+        if (ui.LargePanels?.Any(p => p?.IsVisible == true) == true) return true;
+        return false;
+    });
 
-    private DateTime _lastAreaRefreshAt = DateTime.MinValue;
+    /// <summary>
+    /// A panel the bot NEVER wants open in any state — the MTX shop, passive
+    /// tree, world map, social or settings panel, opened by a stray click or
+    /// keypress landing on the game's own UI. Unlike HasBlockingUiPanel (whose
+    /// list includes sometimes-legitimate popups like the wave-reward window),
+    /// Escape is always the right answer for these, so a watchdog may close
+    /// them unconditionally.
+    /// </summary>
+    public bool HasStrayPanelOpen => SafeRead.Try("gs.stray-panel", () =>
+    {
+        var ui = _gc.IngameState?.IngameUi;
+        if (ui == null) return false;
+        return ui.MicrotransactionShopWindow?.IsVisible == true
+            || ui.TreePanel?.IsVisible == true
+            || ui.WorldMap?.IsVisible == true
+            || ui.SocialPanel?.IsVisible == true
+            || ui.SettingsPanel?.IsVisible == true;
+    });
+
+    private long _lastAreaRefreshAt = Clock.Never;
 
     /// <summary>Force the host to re-read the current area and rebuild its caches
     /// (entity list, terrain, area name/hash) — the recovery for a MISSED area
@@ -125,55 +104,27 @@ public sealed class GameStateService(GameController gc)
     /// give the host a moment (~1s) to rebuild before re-checking.</summary>
     public bool TryForceRefreshArea()
     {
-        if ((DateTime.Now - _lastAreaRefreshAt).TotalSeconds < 10) return false;
-        _lastAreaRefreshAt = DateTime.Now;
-        try
+        if (Clock.SecondsSince(_lastAreaRefreshAt) < 10) return false;
+        _lastAreaRefreshAt = Clock.NowMs;
+        return SafeRead.Try("gs.force-refresh", () =>
         {
             _gc.Area.ForceRefreshArea(true);
             return true;
-        }
-        catch
-        {
-            return false;
-        }
+        });
     }
 
     /// <summary>Whether the Atlas panel (which embeds the map device UI) is open.
     /// The Atlas and other panels (stash, ...) are mutually exclusive — opening
     /// one closes the other — so a flow that needs ITS panel while the Atlas is
     /// up must Escape the Atlas first and then REOPEN its own panel.</summary>
-    public bool IsAtlasOpen
-    {
-        get
-        {
-            try
-            {
-                return _gc.IngameState?.IngameUi?.Atlas?.IsVisible == true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-    }
+    public bool IsAtlasOpen =>
+        SafeRead.Try("gs.atlas-open", () => _gc.IngameState?.IngameUi?.Atlas?.IsVisible == true);
 
     /// <summary>The generic popup window (wave-reward/modifier dialogs) alone —
     /// the one panel class that can sit ABOVE the map device window and swallow
     /// its clicks without the device UI itself counting as "blocking".</summary>
-    public bool HasPopupOpen
-    {
-        get
-        {
-            try
-            {
-                return _gc.IngameState?.IngameUi?.PopUpWindow?.IsVisible == true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-    }
+    public bool HasPopupOpen =>
+        SafeRead.Try("gs.popup-open", () => _gc.IngameState?.IngameUi?.PopUpWindow?.IsVisible == true);
 
     /// <summary>
     /// One-line diagnosis of what the cursor is ACTUALLY on: the world entity
@@ -333,9 +284,8 @@ public sealed class GameStateService(GameController gc)
     /// section, ALL named "1", type Map), folders and special tabs -- only
     /// Normal/Premium/Quad tabs accept arbitrary loot, so only those are offered.
     /// </summary>
-    public IReadOnlyList<string> GetStashTabNames()
-    {
-        try
+    public IReadOnlyList<string> GetStashTabNames() =>
+        SafeRead.Try<IReadOnlyList<string>>("gs.stash-tabs", () =>
         {
             var tabs = _gc.IngameState?.Data?.ServerData?.PlayerStashTabs;
             if (tabs == null) return [];
@@ -348,12 +298,7 @@ public sealed class GameStateService(GameController gc)
                 .OrderBy(t => t.VisibleIndex)
                 .Select(t => t.Name)
                 .ToList();
-        }
-        catch
-        {
-            return [];
-        }
-    }
+        }) ?? [];
 
     /// <summary>Tiles below this targeting-layer value block sight. Chosen strict:
     /// unnecessary walking is harmless, hovering through a wall is not.</summary>
@@ -368,16 +313,8 @@ public sealed class GameStateService(GameController gc)
     /// </summary>
     public bool HasLineOfSight(System.Numerics.Vector2 from, System.Numerics.Vector2 to)
     {
-        int[][]? grid;
-        try
-        {
-            grid = _gc.IngameState?.Data?.RawTerrainTargetingData;
-        }
-        catch
-        {
-            return true;
-        }
-
+        var grid = SafeRead.Try("gs.terrain-targeting",
+            () => _gc.IngameState?.Data?.RawTerrainTargetingData);
         if (grid == null || grid.Length == 0) return true;
 
         int x0 = (int)from.X, y0 = (int)from.Y;

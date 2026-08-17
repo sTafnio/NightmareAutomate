@@ -59,16 +59,7 @@ public sealed class GridPathfinder
     /// </summary>
     public async Task LookForRoute(Func<Vector2> getTarget, Action<List<Vector2i>> onPathFound, CancellationToken ct)
     {
-        int[][]? terrain;
-        try
-        {
-            terrain = _gc.IngameState?.Data?.RawPathfindingData;
-        }
-        catch
-        {
-            terrain = null;
-        }
-
+        var terrain = SafeRead.Try("path.terrain", () => _gc.IngameState?.Data?.RawPathfindingData);
         if (terrain == null || terrain.Length == 0) return;
 
         var rows = terrain.Length;

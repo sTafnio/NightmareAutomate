@@ -36,7 +36,7 @@ public sealed class InputService
         _tryGetInputController?.Invoke(_pluginName);
 
     private Vector2 _lastHoverPos;
-    private DateTime _lastHoverAt = DateTime.MinValue;
+    private long _lastHoverAt = Clock.Never;
 
     /// <summary>
     /// Move the mouse to a screen position using humanized movement.
@@ -57,13 +57,13 @@ public sealed class InputService
     /// </summary>
     public async SyncTask<bool> HoverMouse(Vector2 screenPos, CancellationToken ct)
     {
-        var sinceMs = (DateTime.Now - _lastHoverAt).TotalMilliseconds;
+        var sinceMs = Clock.MsSince(_lastHoverAt);
         if (sinceMs < 80)
             return true;
         if (sinceMs < 250 && Vector2.Distance(screenPos, _lastHoverPos) < 25)
             return true;
 
-        _lastHoverAt = DateTime.Now;
+        _lastHoverAt = Clock.NowMs;
         _lastHoverPos = screenPos;
         return await MoveMouse(screenPos, ct);
     }

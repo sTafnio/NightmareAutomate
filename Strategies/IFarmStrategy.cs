@@ -28,6 +28,14 @@ public interface IFarmStrategy
     IReadOnlyList<string> MapDeviceItemPaths { get; }
 
     /// <summary>
+    /// Stash tab to restock this strategy's map-device items from (typically
+    /// backed by a strategy-specific setting). Empty = no restocking; the
+    /// session ends when the on-hand items run out. Keeps the generic chores
+    /// pipeline farm-agnostic.
+    /// </summary>
+    string RestockTabName { get; }
+
+    /// <summary>
     /// Strategy-specific progress rows for the debug overlay (e.g. wave counter).
     /// </summary>
     IEnumerable<(string Label, string Value)> GetStatusRows(RunContext run);
