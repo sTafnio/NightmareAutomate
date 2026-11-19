@@ -99,20 +99,27 @@ public sealed class AfflictionatorGateway
 
     /// <summary>
     /// The initiator's wave counter is the truth — e.g. when the bot is started at
-    /// wave 5, our own count would otherwise begin at 1.
+    /// wave 5, our own count would otherwise begin at 1. Except right after a wave
+    /// start: 'wave' lags ~1 s behind 'active' (verified in the logs: "wave 13
+    /// started ... wave=13", then "synced 13 -> 14" 0.8 s later), so callers hold
+    /// off syncing for a moment after counting a start themselves.
+    /// False when the counter is not readable (0 also reads as unknown).
     /// </summary>
-    public void SyncWaveNumber(RunContext run, Entity? afflictionator)
+    public bool SyncWaveNumber(RunContext run, Entity? afflictionator)
     {
         var (_, waveNumber, _) = GetWaveState(afflictionator);
-        if (waveNumber.HasValue && waveNumber.Value != run.WavesStarted)
+        if (!waveNumber.HasValue) return false;
+
+        if (waveNumber.Value != run.WavesStarted)
         {
             _log($"[Simulacrum] Wave counter synced from initiator: {run.WavesStarted} -> {waveNumber.Value}.");
             run.WavesStarted = waveNumber.Value;
         }
+        return true;
     }
 
-    /// <summary>Dump the raw StateMachine values into the log — the record of what
-    /// the initiator actually reported at wave starts/ends.</summary>
+    /// <summary>Log a wave start/end, plus (as a routine step) the raw StateMachine
+    /// values — the record of what the initiator actually reported.</summary>
     public void LogStates(Entity? afflictionator, string context)
     {
         try
@@ -121,7 +128,8 @@ public sealed class AfflictionatorGateway
             var dump = states == null
                 ? "n/a"
                 : string.Join(", ", states.Select(s => $"{s.Name}={s.Value}"));
-            _log($"[Simulacrum] {context}. Initiator states: {dump}");
+            _log($"[Simulacrum] {context}.");
+            BotLog.Step($"[Simulacrum] Initiator states: {dump}");
         }
         catch (Exception ex)
         {

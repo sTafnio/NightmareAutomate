@@ -33,6 +33,19 @@ public sealed class NavigationService
     /// <summary>How far (grid units) the corner-unstick sidestep tries to move.</summary>
     private const float SidestepDistance = 18f;
 
+    /// <summary>Stop distance (grid units) when an interactable still projects
+    /// off-screen after the approach walk. Well inside the approach's 0.8x
+    /// InteractDistance, so the step actually changes the view.</summary>
+    private const float StepCloserDistance = 4f;
+
+    /// <summary>World units per grid cell.</summary>
+    private const float GridToWorld = 250f / 23f;
+
+    /// <summary>Default wall-clock cap for one walk. The stall watchdog only
+    /// catches walks that stop gaining ground; a target that keeps moving (or a
+    /// route that oscillates) gains ground forever without arriving.</summary>
+    public const int DefaultMaxWalkMs = 120_000;
+
     private static readonly Random SidestepRandom = new();
 
     private readonly GameStateService _gameState;
@@ -92,30 +105,42 @@ public sealed class NavigationService
     /// </summary>
     public SyncTask<bool> MoveToTarget(
         Vector2 targetPos, CancellationToken ct, float stopDistance = 15,
-        bool pathArrival = false, bool keepMoveKeyHeld = false, Func<bool>? stopWhen = null)
-        => MoveToTarget(() => targetPos, ct, stopDistance, pathArrival, keepMoveKeyHeld, stopWhen);
+        bool pathArrival = false, bool keepMoveKeyHeld = false, Func<bool>? stopWhen = null,
+        int maxWalkMs = DefaultMaxWalkMs)
+        => MoveToTarget(() => targetPos, ct, stopDistance, pathArrival, keepMoveKeyHeld, stopWhen, maxWalkMs);
 
     /// <summary>
     /// Live-target variant: the destination is re-read every tick and the route
     /// follows it, so a monster that repositions mid-walk is chased rather than
     /// walked-to-where-it-was.
+    ///
+    /// Cancellation of <paramref name="ct"/> propagates (OperationCanceledException)
+    /// like every other wait — a cut-short walk is not a failed walk, and callers
+    /// must not judge reachability from it.
     /// </summary>
     public async SyncTask<bool> MoveToTarget(
         Func<Vector2> target, CancellationToken ct, float stopDistance = 15,
-        bool pathArrival = false, bool keepMoveKeyHeld = false, Func<bool>? stopWhen = null)
+        bool pathArrival = false, bool keepMoveKeyHeld = false, Func<bool>? stopWhen = null,
+        int maxWalkMs = DefaultMaxWalkMs)
     {
         var stoppedByCondition = false;
         try
         {
-            List<Vector2i>? currentActivePath = null;
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-
-            var routingTask = _pathfinding.LookForRoute(target, updatedPath =>
+            using var route = _pathfinding.BeginRoute();
+            if (route == null)
             {
-                currentActivePath = updatedPath;
-            }, cts.Token);
+                // Callers loop walks per frame (ExploreUntil) — yield, or such a
+                // loop would spin the game thread while terrain is unreadable.
+                LogThrottled("nav-no-terrain", "No terrain data to route on -- not walking.");
+                await TaskUtils.NextFrame();
+                ct.ThrowIfCancellationRequested();
+                return stopWhen?.Invoke() == true ||
+                       Vector2.Distance(_gameState.PlayerGridPos, target()) <
+                       stopDistance * (pathArrival ? 2f : 1.5f);
+            }
 
             var requestedAt = Clock.NowMs;
+            var walkDeadline = Clock.InMs(maxWalkMs);
 
             // No-progress watchdog: while we are actively steering, the character
             // must keep making ground. A stall means stuck geometry OR — the case
@@ -130,12 +155,16 @@ public sealed class NavigationService
 
             try
             {
-                while (!routingTask.IsCompleted && !cts.IsCancellationRequested)
+                while (!route.Finished && !ct.IsCancellationRequested)
                 {
                     // Clean drop already registered (InGame false) — bail instantly.
                     if (!_gameState.IsConnected)
+                        break;
+
+                    if (Clock.Reached(walkDeadline))
                     {
-                        cts.Cancel();
+                        LogThrottled("nav-timeout",
+                            $"Walk did not arrive within {maxWalkMs / 1000}s -- giving up on it.");
                         break;
                     }
 
@@ -144,20 +173,18 @@ public sealed class NavigationService
                     if (stopWhen?.Invoke() == true)
                     {
                         stoppedByCondition = true;
-                        cts.Cancel();
                         break;
                     }
 
                     var playerGridPos = _gameState.PlayerGridPos;
                     var targetPos = target();
+                    route.Update(targetPos, playerGridPos);
+                    var currentActivePath = route.Path;
                     var arrivedNow = pathArrival
                         ? currentActivePath is { Count: > 0 } && currentActivePath.Count <= (int)stopDistance
                         : Vector2.Distance(playerGridPos, targetPos) < stopDistance;
                     if (arrivedNow)
-                    {
-                        cts.Cancel();
                         break;
-                    }
 
                     var steered = false;
                     if (currentActivePath is { Count: > 0 })
@@ -211,7 +238,6 @@ public sealed class NavigationService
                         {
                             LogThrottled("nav-stall",
                                 "No movement progress -- abandoning the walk (stuck or frozen/disconnected).");
-                            cts.Cancel();
                             break;
                         }
                     }
@@ -227,8 +253,7 @@ public sealed class NavigationService
                     await ReleaseMoveKey();
             }
 
-            try { await routingTask; }
-            catch (OperationCanceledException) { /* Expected on arrival */ }
+            ct.ThrowIfCancellationRequested();
 
             var arrived = stoppedByCondition ||
                           Vector2.Distance(_gameState.PlayerGridPos, target()) < stopDistance * (pathArrival ? 2f : 1.5f);
@@ -237,11 +262,7 @@ public sealed class NavigationService
                 LogThrottled("nav-failed", "Navigation finished without arriving (no route / not reached).");
             return arrived;
         }
-        catch (OperationCanceledException)
-        {
-            return false;
-        }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log($"Error in NavigationService: {ex.Message}");
             return false;
@@ -335,7 +356,7 @@ public sealed class NavigationService
 
         var moveKey = _getMoveKey();
         await _input.HoverMouse(clickPos, ct);
-        if (!InputService.IsKeyDown(moveKey))
+        if (!_input.IsKeyDown(moveKey))
             await _input.KeyDown(moveKey, ct);
         return true;
     }
@@ -352,7 +373,7 @@ public sealed class NavigationService
     {
         if (Vector2.Distance(_gameState.PlayerGridPos, target.GridPosNum) > approachDistance)
         {
-            _log($"Target entity too far, moving closer ({target.Path})...");
+            BotLog.Step($"Moving closer to {target.Path}...");
             await MoveToTarget(target.GridPosNum, ct, approachDistance * 0.8f);
 
             // The walk can fail outright (no route). Clicking from across the map
@@ -365,6 +386,29 @@ public sealed class NavigationService
             }
         }
 
+        return await HoverAndClick(target, ct, allowStepCloser: true);
+    }
+
+    /// <summary>
+    /// Hover + click an entity from wherever the character stands — no approach
+    /// walk, and no stepping closer when the projection sits awkwardly. The game
+    /// auto-walks the character into the target itself, which is the whole point
+    /// when standing NEXT to the target is the problem: a fixed UI panel (the
+    /// Simulacrum wave-start dialog) draws over the middle of the screen, exactly
+    /// where a nearby interactable projects. Still refuses to click blind — the
+    /// entity must take the hover highlight first.
+    /// </summary>
+    public SyncTask<bool> ClickEntityAtRange(Entity target, CancellationToken ct)
+        => HoverAndClick(target, ct, allowStepCloser: false);
+
+    /// <summary>
+    /// The hover-verify-click half of <see cref="ClickEntity"/>: stand still,
+    /// project the interact center, hover it (with jittered retries), and click
+    /// only once the entity actually reports the highlight.
+    /// </summary>
+    private async SyncTask<bool> HoverAndClick(
+        Entity target, CancellationToken ct, bool allowStepCloser)
+    {
         await ReleaseMoveKey();
         await WaitForStandstill(ct);
 
@@ -379,12 +423,26 @@ public sealed class NavigationService
         if (!CoordinateHelpers.IsInsideWindow(screenCoord, rect.Width, rect.Height,
                 CoordinateHelpers.ClickMarginX, CoordinateHelpers.ClickMarginY))
         {
-            await MoveToTarget(target.GridPosNum, ct, InteractDistance * 0.8f);
+            if (!allowStepCloser)
+            {
+                _log($"Entity projects outside the window from here, not clicking ({target.Path}). " +
+                     DescribeProjection(target, screenCoord, rect.Width, rect.Height));
+                return false;
+            }
+
+            // The approach walk already stops at 0.8x InteractDistance, so walking
+            // to that same distance again does nothing. On 2026-11-17 all 10 return
+            // attempts failed instantly from one spot because of that. Step in for real.
+            await MoveToTarget(target.GridPosNum, ct, StepCloserDistance);
+            await WaitForStandstill(ct);
+            render = target.GetComponent<Render>();
+            center = render?.InteractCenterNum ?? target.PosNum;
             screenCoord = _gameState.WorldToScreen(center);
             if (!CoordinateHelpers.IsInsideWindow(screenCoord, rect.Width, rect.Height,
                     CoordinateHelpers.ClickMarginX, CoordinateHelpers.ClickMarginY))
             {
-                _log($"Entity stays outside the window, not clicking ({target.Path}).");
+                _log($"Entity stays outside the window, not clicking ({target.Path}). " +
+                     DescribeProjection(target, screenCoord, rect.Width, rect.Height));
                 return false;
             }
         }
@@ -426,6 +484,25 @@ public sealed class NavigationService
     }
 
     /// <summary>
+    /// Diagnostic tail for an off-screen projection, so the log shows which input
+    /// was wrong: the projected point vs the window, the grid distance, and how
+    /// far the Render position sits from the Positioned grid position. Those two
+    /// components normally agree within a cell or two; a big gap means stale
+    /// entity data rather than geometry.
+    /// </summary>
+    private string DescribeProjection(Entity target, Vector2 screen, float width, float height)
+    {
+        var grid = target.GridPosNum;
+        var dist = Vector2.Distance(_gameState.PlayerGridPos, grid);
+        var renderPos = target.GetComponent<Render>()?.PosNum;
+        var gap = renderPos is { } rp
+            ? Vector2.Distance(new Vector2(rp.X, rp.Y) / GridToWorld, grid).ToString("0.0")
+            : "no render";
+        return $"screen=({screen.X:0},{screen.Y:0}) window={width:0}x{height:0} " +
+               $"dist={dist:0.0} render-vs-grid={gap}";
+    }
+
+    /// <summary>
     /// Move the mouse to a window-relative position (e.g. WorldToScreen output),
     /// applying the window offset. Throttled and hard-clamped into the window —
     /// used for hovering monsters for ReAgent.
@@ -460,16 +537,22 @@ public sealed class NavigationService
     public async SyncTask<bool> ReleaseMoveKey()
     {
         var moveKey = _getMoveKey();
-        if (InputService.IsKeyDown(moveKey))
+        if (_input.IsKeyDown(moveKey))
         {
             await _input.KeyUp(moveKey);
         }
         return true;
     }
 
+    /// <summary>
+    /// Release the move key AND the modifiers (Ctrl/Shift) — for interrupts and
+    /// pauses, where the cut-short step never reached its own releases.
+    /// </summary>
+    public SyncTask<bool> ReleaseAllKeys() => _input.ReleaseHeldKeys(_getMoveKey());
+
     private Vector2 ConvertGridToScreen(Vector2i gridPoint)
     {
-        const float gridToWorldMultiplier = 250f / 23f;
+        const float gridToWorldMultiplier = GridToWorld;
         float worldZ = _gameState.PlayerZ;
 
         var heightData = _gameState.RawTerrainHeightData;

@@ -250,14 +250,23 @@ public sealed class StashService
                 return PullResult.Failed;
             }
 
-            var item = FindVisibleTabItem(itemPathFragment);
+            var (item, tabReadable) = await WaitForVisibleTabItem(itemPathFragment, ct);
             if (item == null)
             {
-                // Tab items can stream in a beat late right after the switch.
-                if (attempt == 0)
+                if (!IsStashInteractable)
                 {
-                    await Task.Delay(500, ct);
-                    continue;
+                    LastFailure = "The stash panel closed (or got covered) mid-restock.";
+                    _log($"[Stash] {LastFailure}");
+                    return PullResult.Failed;
+                }
+
+                // Never readable at all = no verdict on the contents; Empty would
+                // end the session on a read hiccup.
+                if (!tabReadable)
+                {
+                    LastFailure = $"The contents of tab '{tabName}' could not be read.";
+                    _log($"[Stash] {LastFailure}");
+                    return PullResult.Failed;
                 }
 
                 _log($"[Stash] No '{itemPathFragment}' in tab '{tabName}'.");
@@ -287,14 +296,34 @@ public sealed class StashService
         return PullResult.Failed;
     }
 
+    /// <summary>How long a matching item may take to appear in a freshly shown tab.
+    /// The game fetches a tab's contents from the server on its first view after
+    /// a zone change; right after arriving in the hideout that takes well over
+    /// the old 0.8s, which read as "tab empty" and ended whole sessions.</summary>
+    private const int TabContentsWaitMs = 3000;
+
     /// <summary>
-    /// First item element in the visible tab whose entity path matches.
+    /// Wait for an item matching the path to appear in the visible tab. Returns
+    /// it (null on timeout) and whether the tab's item list was readable at least
+    /// once — a list that never read at all says nothing about the contents.
+    /// Throttled: a quad tab's item list is not free to walk every frame.
     /// </summary>
-    private ExileCore.PoEMemory.Elements.InventoryElements.NormalInventoryItem? FindVisibleTabItem(
-        string itemPathFragment) =>
-        Helpers.SafeRead.Try("stash.visible-tab-item", () =>
-            VisibleStashInventory?.VisibleInventoryItems?
-                .FirstOrDefault(i => i?.Item?.Path != null && i.Item.Path.Contains(itemPathFragment)));
+    private async SyncTask<(ExileCore.PoEMemory.Elements.InventoryElements.NormalInventoryItem? Item, bool Readable)>
+        WaitForVisibleTabItem(string itemPathFragment, CancellationToken ct)
+    {
+        ExileCore.PoEMemory.Elements.InventoryElements.NormalInventoryItem? found = null;
+        var readable = false;
+        await Helpers.WaitHelpers.For(Helpers.WaitHelpers.Throttle(() =>
+        {
+            var items = Helpers.SafeRead.Try("stash.visible-tab-items",
+                () => VisibleStashInventory?.VisibleInventoryItems?.ToList());
+            if (items == null) return false;
+            readable = true;
+            found = items.FirstOrDefault(i => i?.Item?.Path != null && i.Item.Path.Contains(itemPathFragment));
+            return found != null;
+        }, 150), TabContentsWaitMs, ct);
+        return (found, readable);
+    }
 
     /// <summary>
     /// The main inventory's server-side change counter — bumps whenever the
@@ -314,8 +343,8 @@ public sealed class StashService
     /// </summary>
     private async SyncTask<bool> DumpIntoCurrentTab(CancellationToken ct)
     {
-        using var controller = _input.AcquireController();
-        if (controller == null)
+        using var lease = _input.Rent();
+        if (lease.Controller is not { } controller)
         {
             _log("[Stash] Could not acquire the input controller.");
             return false;
@@ -353,7 +382,8 @@ public sealed class StashService
                     }
                     finally
                     {
-                        await controller.KeyUp(Keys.LShiftKey, false, ct);
+                        // Never cancellable: a cancelled release leaves Shift held in game.
+                        await controller.KeyUp(Keys.LShiftKey, false, CancellationToken.None);
                     }
 
                     moved = await WaitForInventoryChange(counterBefore, 1500, ct);
@@ -370,7 +400,7 @@ public sealed class StashService
         }
         finally
         {
-            await controller.KeyUp(Keys.LControlKey, false, ct);
+            await controller.KeyUp(Keys.LControlKey, false, CancellationToken.None);
         }
 
         // Two items in a row refused to move — treat the tab as full.
@@ -453,8 +483,149 @@ public sealed class StashService
         return true;
     }
 
+    /// <summary>Grid distances the "click it from afar" fallback backs off to.
+    /// Far enough that the stash stops projecting into the middle of the screen,
+    /// close enough that it stays inside the entity bubble.</summary>
+    private static readonly float[] RemoteClickRadii = [40f, 65f, 90f];
+
+    /// <summary>How many repositioned remote clicks the fallback makes. Bounded on
+    /// purpose — when the stash stays covered, the ANSWER is the caller's
+    /// escalation (leave the area, stash in the hideout, come back), never
+    /// another lap of clicking.</summary>
+    private const int MaxRemoteAttempts = 3;
+
+    /// <summary>Whole-flow budget for one <see cref="OpenStashPanel"/> call. Every
+    /// phase is bounded on its own already; this is the backstop that keeps a
+    /// pathological area from turning one deposit into a ten-minute stall.</summary>
+    private const int OpenStashBudgetSeconds = 150;
+
+    /// <summary>How far a window-relative point lies OUTSIDE a rect (0 when inside).</summary>
+    private static float DistanceOutside(SharpDX.RectangleF rect, Vector2 p)
+    {
+        var dx = Math.Max(Math.Max(rect.Left - p.X, p.X - rect.Right), 0f);
+        var dy = Math.Max(Math.Max(rect.Top - p.Y, p.Y - rect.Bottom), 0f);
+        return MathF.Sqrt(dx * dx + dy * dy);
+    }
+
+    /// <summary>The screen area a world click must avoid: the visible panels when
+    /// the game exposes them, otherwise the screen's middle — where every big
+    /// panel draws, including the Simulacrum wave-start dialog, which the game
+    /// does NOT expose in any of its panel lists.</summary>
+    private SharpDX.RectangleF CoveredScreenArea()
+    {
+        var window = _gameState.WindowRect;
+        var blocked = _gameState.BlockingUiRect;
+        if (blocked.IsEmpty || blocked.Width <= 1 || blocked.Height <= 1)
+            return new SharpDX.RectangleF(
+                window.Width * 0.20f, window.Height * 0.12f,
+                window.Width * 0.60f, window.Height * 0.72f);
+
+        blocked.Inflate(window.Width * 0.03f, window.Height * 0.03f);
+        return blocked;
+    }
+
+    /// <summary>
+    /// Open the stash WITHOUT standing next to it.
+    ///
+    /// The normal flow walks into interact range first, which puts the stash's
+    /// screen point in the middle of the screen — exactly where a large fixed
+    /// panel draws. Seen live: with the Simulacrum wave-start dialog up the stash
+    /// is covered completely and refuses to highlight from every angle, so
+    /// re-approaching can only ever fail again.
+    ///
+    /// Backing AWAY moves the projection toward a clear part of the screen. The
+    /// spot is computed, not guessed: the camera rides the character, so a grid
+    /// step of d shifts every world point on screen by -screenDelta(d), which
+    /// says up front where the stash would land from each candidate spot. The
+    /// click then happens from range, and the game auto-walks the character into
+    /// the stash on its own.
+    /// </summary>
+    private async SyncTask<bool> TryOpenFromDistance(CancellationToken ct)
+    {
+        var stash = _gameState.FindStash();
+        if (stash == null) return false;
+
+        var window = _gameState.WindowRect;
+        var blocked = CoveredScreenArea();
+        var stashScreen = _gameState.EntityScreenPoint(stash);
+        var playerGrid = _gameState.PlayerGridPos;
+        var stashGrid = stash.GridPosNum;
+        var terrain = Helpers.SafeRead.Try("stash.terrain",
+            () => _gameState.Controller.IngameState?.Data?.RawPathfindingData);
+
+        var candidates = new List<(Vector2 Spot, float Score)>();
+        foreach (var radius in RemoteClickRadii)
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                var angle = i * Math.PI / 4;
+                var dir = new Vector2((float)Math.Cos(angle), (float)Math.Sin(angle));
+                var spot = stashGrid + dir * radius;
+
+                // A spot inside a wall is never reached: the walk ends short and
+                // the prediction below would describe a place we never stood on.
+                if (terrain != null &&
+                    !Helpers.TerrainGrid.IsWalkable(terrain, terrain.Length, (int)spot.X, (int)spot.Y))
+                    continue;
+
+                var predicted = stashScreen - _gameState.GridDeltaToScreenDelta(spot - playerGrid);
+
+                if (!Helpers.CoordinateHelpers.IsInsideWindow(predicted, window.Width, window.Height,
+                        Helpers.CoordinateHelpers.ClickMarginX, Helpers.CoordinateHelpers.ClickMarginY))
+                    continue;
+
+                var clearance = DistanceOutside(blocked, predicted);
+                if (clearance <= 0f) continue;
+
+                // Clear of the panel first, short walk second.
+                candidates.Add((spot, clearance - Vector2.Distance(playerGrid, spot) * 0.5f));
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            _log("[Stash] No standing spot would put the stash clear of the UI -- giving up on this stash.");
+            return false;
+        }
+
+        foreach (var (spot, _) in candidates.OrderByDescending(c => c.Score).Take(MaxRemoteAttempts))
+        {
+            if (ct.IsCancellationRequested) break;
+
+            _log($"[Stash] Stash is covered from up close -- backing off to {spot} to click it from range.");
+            await _navigation.MoveToTarget(spot, ct, 10);
+
+            // Judge the projection as it ACTUALLY is now: the walk may have been
+            // cut short, and the panel may have changed size or gone away.
+            stash = _gameState.FindStash();
+            if (stash == null) continue;
+            if (IsStashInteractable) return true;
+
+            var here = _gameState.EntityScreenPoint(stash);
+            if (!Helpers.CoordinateHelpers.IsInsideWindow(here, window.Width, window.Height,
+                    Helpers.CoordinateHelpers.ClickMarginX, Helpers.CoordinateHelpers.ClickMarginY) ||
+                DistanceOutside(CoveredScreenArea(), here) <= 0f)
+            {
+                _log("[Stash] The stash still projects under the UI from there -- trying another spot.");
+                continue;
+            }
+
+            if (!await _navigation.ClickEntityAtRange(stash, ct))
+                continue;
+
+            // The click only queues an auto-walk from up to 90 units away — the
+            // panel opens when the character arrives, not when it clicks.
+            if (await Helpers.WaitHelpers.For(() => IsStashInteractable, 12000, ct))
+                return true;
+        }
+
+        return false;
+    }
+
     public async SyncTask<bool> OpenStashPanel(CancellationToken ct)
     {
+        var budget = Helpers.Clock.InSeconds(OpenStashBudgetSeconds);
+
         // Right after an area transition (chores start the moment we land back in
         // the hideout) the entity list is still streaming — the stash appears a
         // beat after IsLoading clears. Wait for it instead of failing instantly;
@@ -479,7 +650,8 @@ public sealed class StashService
             }
         }
 
-        for (var attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
+        for (var attempt = 0; attempt < 3 && !ct.IsCancellationRequested &&
+                              !Helpers.Clock.Reached(budget); attempt++)
         {
             // Blocking panels first: the Atlas can sit OVER an already-open
             // stash panel (both report visible), so "stash open" may only be
@@ -499,7 +671,8 @@ public sealed class StashService
             // the Simulacrum wave-modifier panel can draw over the stash from a
             // distance, swallowing the click. It also waits for the stash to
             // highlight (isTargeted) under the cursor before clicking.
-            _log($"[Stash] Opening stash (attempt {attempt + 1})...");
+            if (attempt == 0) Helpers.BotLog.Step("[Stash] Opening stash...");
+            else _log($"[Stash] Opening stash (attempt {attempt + 1})...");
             await _navigation.ClickEntity(stash, ct);
 
             // Generous timeout: a direct click from across the screen auto-walks
@@ -508,9 +681,9 @@ public sealed class StashService
                 return true;
         }
 
-        // Three direct attempts down: before the directional fallback, rule out
-        // the host reading stale state (entity positions, panel flags) — the
-        // refresh rebuilds its caches; the fallback then works on fresh data.
+        // Three direct attempts down: before the fallbacks, rule out the host
+        // reading stale state (entity positions, panel flags) — the refresh
+        // rebuilds its caches; the fallbacks then work on fresh data.
         if (_gameState.TryForceRefreshArea())
         {
             _log("[Stash] Direct attempts failed -- forced an area refresh before the fallback.");
@@ -518,12 +691,24 @@ public sealed class StashService
             if (IsStashInteractable) return true;
         }
 
-        // Directional fallback: from one side the stash can refuse to highlight
-        // (something draws over it from that angle — seen in Simulacrum areas).
+        // Name the thief before falling back: when a panel is what covers the
+        // stash, that identity is the whole diagnosis in tomorrow's log.
+        _log($"[Stash] Direct clicks failed. {_gameState.DescribeHoverTarget()}");
+
+        // First fallback: step AWAY and click from range. A panel that covers the
+        // stash covers it from every nearby angle — only a different projection
+        // helps, and only distance changes the projection. Tried before the
+        // approach angles because it is the one that fixes the known Simulacrum
+        // case (the wave-start dialog drawn over the stash).
+        if (!Helpers.Clock.Reached(budget) && await TryOpenFromDistance(ct))
+            return true;
+
+        // Second fallback: from one side the stash can refuse to highlight
+        // because a WORLD object (a doodad, a minion) steals the highlight there.
         // Approach from north, south, east, west and retry the hover+click from
         // each side before giving up.
         var target = _gameState.FindStash();
-        if (target != null)
+        if (target != null && !Helpers.Clock.Reached(budget))
         {
             Vector2[] offsets =
             [
@@ -535,7 +720,7 @@ public sealed class StashService
 
             foreach (var offset in offsets)
             {
-                if (ct.IsCancellationRequested) break;
+                if (ct.IsCancellationRequested || Helpers.Clock.Reached(budget)) break;
                 await CloseBlockingPanel(ct);
                 if (IsStashInteractable) return true;
                 _log("[Stash] Stash won't highlight -- approaching from another side...");
@@ -546,8 +731,9 @@ public sealed class StashService
             }
         }
 
-        LastFailure = "The stash panel did not open after 3 direct clicks and 4 approach angles.";
-        _log("[Stash] Failed to open stash panel.");
+        LastFailure = "The stash panel did not open -- direct clicks, clicks from range " +
+                      "and four approach angles all failed (something is covering it).";
+        _log($"[Stash] {LastFailure}");
         return false;
     }
 }

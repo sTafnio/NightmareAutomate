@@ -243,7 +243,7 @@ public sealed class MapDeviceService
             var toggle = FindStorageToggleCandidate();
             if (toggle == null) break;
 
-            _log($"[MapDevice] Clicking the storage toggle at {RectDesc(toggle)}.");
+            BotLog.Step($"[MapDevice] Clicking the storage toggle at {RectDesc(toggle)}.");
             await _input.ClickRect(toggle.GetClientRectCache, MouseButtons.Left, ct);
             await Task.Delay(500, ct);
             if (StorageItemsClickable()) return true;
@@ -317,7 +317,7 @@ public sealed class MapDeviceService
         if (!await EnsureInventoryPanelOpen(ct)) return false;
 
         var storageBefore = _inventory.CountItems(_inventory.MapDeviceStorage, itemPath);
-        _log("[MapDevice] Parking the spare fragment from the inventory into the device storage...");
+        BotLog.Step("[MapDevice] Parking the spare fragment from the inventory into the device storage...");
         await ClickInventoryFragment(itemPath, MouseButtons.Left, ctrl: true, ct);
 
         var moved = await WaitFor(() =>
@@ -572,10 +572,12 @@ public sealed class MapDeviceService
         {
             if (verify()) return true;
 
-            _log($"[MapDevice] {name} (attempt {i}/{attempts})...");
+            var step = $"[MapDevice] {name} (attempt {i}/{attempts})...";
+            if (i == 1) BotLog.Step(step);
+            else _log(step);
             var acted = await action();
             if (!acted)
-                _log($"[MapDevice] {name}: action reported failure -- verifying anyway. {UiState(itemPath)}");
+                BotLog.Step($"[MapDevice] {name}: action reported failure -- verifying anyway. {UiState(itemPath)}");
 
             if (await WaitFor(verify, verifyTimeoutMs, ct)) return true;
             _log($"[MapDevice] {name}: not confirmed within {verifyTimeoutMs}ms. {UiState(itemPath)}");
@@ -625,7 +627,7 @@ public sealed class MapDeviceService
     {
         if (IsInMapSlot(itemPath) && IsDeviceWindowOpen)
         {
-            _log("[MapDevice] Map slot already loaded.");
+            BotLog.Step("[MapDevice] Map slot already loaded.");
             await StowInventorySpareToStorage(itemPath, ct);
             return MapDeviceResult.Success;
         }
@@ -871,7 +873,7 @@ public sealed class MapDeviceService
             () => ClickActivateButton(ct), 8000, ct, attempts: 2);
 
         if (ok)
-            _log($"[MapDevice] {_gameState.FindFarmPortals(isFarmArea).Count} portals detected.");
+            BotLog.Step($"[MapDevice] {_gameState.FindFarmPortals(isFarmArea).Count} portals detected.");
         return ok;
     }
 
@@ -884,7 +886,7 @@ public sealed class MapDeviceService
             return false;
         }
 
-        _log("[MapDevice] Clicking Activate...");
+        BotLog.Step("[MapDevice] Clicking Activate...");
         return await _input.ClickRect(button.GetClientRectCache, MouseButtons.Left, ct);
     }
 

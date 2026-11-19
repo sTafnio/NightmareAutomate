@@ -42,6 +42,15 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
     private const int TotalWaves = 15;
 
+    /// <summary>Hideout round trips allowed per run to empty a full inventory when
+    /// the in-area stash cannot be opened. Each one costs a portal, and the point
+    /// is to break the deadlock, not to shuttle all night.</summary>
+    private const int MaxStashTrips = 2;
+
+    /// <summary>Portals that must remain for a stash trip: the trip's re-entry
+    /// spends one, and the rest of the run still needs one to survive a death.</summary>
+    private const int MinPortalsForStashTrip = 2;
+
     /// <summary>Never hovered, targeted, or counted as wave presence — Delirium
     /// volatiles explode on their own and must not be chased, and InvisibleAura
     /// carriers ("Banner of Hatred" etc., planted by Lunaris/Solaris Champions)
@@ -102,9 +111,29 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     private long _lastMonsterSeenAt = Clock.Never;
     private long _waveClickAt = Clock.Never;
     private int _waveClickAttempts;
+
+    /// <summary>When our own click's wave start was counted. The initiator's wave
+    /// number lags ~1 s behind its 'active' flag, so for this long after a counted
+    /// start its (still previous) number must not pull our count back.</summary>
+    private long _waveCountedAt = Clock.Never;
+    private const int WaveNumberLagSeconds = 5;
     private int _waveStartReEntries;
     private long _gemLevelAt = Clock.Never;
     private bool _warnedInventoryFull;
+
+    /// <summary>Hideout stash trips taken in this run. The in-area stash flow is
+    /// already exhaustive (direct clicks, clicks from range, every approach
+    /// angle), so a failure means it is genuinely unusable here — usually a fixed
+    /// UI panel drawn over it. The escalation is a portal trip, and it is capped:
+    /// once spent, looting stops for the rest of the run rather than looping.</summary>
+    private int _stashTripsTaken;
+
+    /// <summary>A hideout stash trip is owed to the engine — set inside the loot
+    /// pause, acted on when it unwinds (the engine owns leaving and re-entering).</summary>
+    private bool _stashTripRequested;
+
+    /// <summary>The trip budget is spent: stop trying to deposit in this run.</summary>
+    private bool _inAreaStashGivenUp;
     private bool _settleDone;
     private bool _sawServerMonstersThisWave;
     private long _lootDivertAt = Clock.Never;
@@ -153,9 +182,13 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         _lastMonsterSeenAt = Clock.Never;
         _waveClickAt = Clock.Never;
         _waveClickAttempts = 0;
+        _waveCountedAt = Clock.Never;
         _waveStartReEntries = 0;
         _gemLevelAt = Clock.Never;
         _warnedInventoryFull = false;
+        _stashTripsTaken = 0;
+        _stashTripRequested = false;
+        _inAreaStashGivenUp = false;
         _settleDone = false;
         _sawServerMonstersThisWave = false;
         _lootDivertAt = Clock.Never;
@@ -225,7 +258,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             return SimPhase.LootPause;
         }
 
-        _log("[Simulacrum] Initiator says goodbye -- run complete.");
+        BotLog.Step("[Simulacrum] Initiator says goodbye -- run complete.");
         return SimPhase.Finishing;
     }
 
@@ -244,7 +277,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // around us — adopt the running wave right here instead of walking away.
         if (GetNearbyMonsters().Count > 0)
         {
-            _log("[Simulacrum] Monsters around us -- resuming the running wave.");
+            BotLog.Step("[Simulacrum] Monsters around us -- resuming the running wave.");
             return SimPhase.StartingWave;
         }
 
@@ -258,7 +291,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // walk back toward its remembered position until it streams in.
         if (StartPoint is { } startPoint)
         {
-            _log($"[Simulacrum] Moving toward the start point {startPoint}...");
+            BotLog.Step($"[Simulacrum] Moving toward the start point {startPoint}...");
             await _navigation.MoveToTarget(startPoint, ct, 90);
             aff = _initiator.Find();
 
@@ -284,7 +317,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
             if (_initiator.Find() != null)
             {
-                _log($"[Simulacrum] Initiator discovered at {StartPoint}.");
+                BotLog.Step($"[Simulacrum] Initiator discovered at {StartPoint}.");
                 return SimPhase.StartingWave;
             }
         }
@@ -300,7 +333,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // Wave already running (adopted run, click landed, or monsters wandered in).
         var monsters = GetNearbyMonsters();
         var aff = _initiator.Find();
-        _initiator.SyncWaveNumber(run, aff); // the initiator's counter wins when readable
+        SyncWaveCounter(run, aff); // the initiator's counter wins when readable
 
         // 15/15 complete: 'active' never goes idle again after the final wave —
         // 'goodbye' is the authoritative end-of-run signal (verified live).
@@ -326,14 +359,28 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // A running wave (our click landed, or an adopted run): count it and fight.
         if (_initiator.IsWaveActive(aff) == true)
         {
-            run.WavesStarted++;
-            _initiator.SyncWaveNumber(run, aff);
+            // Our click started it: the initiator's number still shows the
+            // PREVIOUS wave for ~1 s (verified in the logs), so count it ourselves
+            // and hold that against the stale value. No click this cycle means a
+            // wave that was already running (re-entry, adopted run) — then the
+            // initiator's number is current and wins; +1 only when unreadable.
+            // (A click from before a death/re-entry is not "ours" any more.)
+            if (_waveClickAttempts > 0 && Clock.SecondsSince(_waveClickAt) < 10)
+            {
+                run.WavesStarted++;
+                _waveCountedAt = Clock.NowMs;
+            }
+            else if (!_initiator.SyncWaveNumber(run, aff))
+            {
+                run.WavesStarted++;
+            }
+
             _waveClickAttempts = 0;
             _lastMonsterSeenAt = Clock.NowMs;
             _sawServerMonstersThisWave = false;
             // The wave start destroyed all ground items — stale spots must not linger.
             _lootService.ForgetAll();
-            _initiator.LogStates(aff, $"wave {run.WavesStarted} started");
+            _initiator.LogStates(aff, $"Wave {run.WavesStarted} started");
             return SimPhase.Fighting;
         }
 
@@ -364,7 +411,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             Clock.SecondsSince(_lootDivertAt) > 30)
         {
             _lootDivertAt = Clock.NowMs;
-            _log("[Simulacrum] Loot on the ground -- collecting it before the next wave.");
+            BotLog.Step("[Simulacrum] Loot on the ground -- collecting it before the next wave.");
             return SimPhase.LootPause;
         }
 
@@ -428,8 +475,10 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             return SimPhase.Finishing;
         }
 
-        _waveClickAttempts++;
-        _waveClickAt = Clock.NowMs;
+        // The attempt is only COUNTED once its click went out: a step cut short
+        // before that (lost focus, recovery) is re-run from the top and must not
+        // burn the escalation that ends in a portal re-entry.
+        var attempt = _waveClickAttempts + 1;
         // The counter belongs to the PREVIOUS wave until the new one registers —
         // clearing it here keeps the loot-spawn branch from misreading the gap
         // between the click and the server's first monster count.
@@ -441,22 +490,25 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // with nothing to close brings up the game menu, which would then swallow
         // the click itself. Attempts 4-5 re-approach from a side step so the
         // projection and highlight get a fresh angle.
-        if (_waveClickAttempts == 3 && _gameState.HasBlockingUiPanel)
+        if (attempt == 3 && _gameState.HasBlockingUiPanel)
         {
             _log("[Simulacrum] Clicks are not landing -- pressing Escape to close the open panel.");
             await _input.PressKey(Keys.Escape, ct);
             await Task.Delay(300, ct);
         }
-        else if (_waveClickAttempts is 4 or 5)
+        else if (attempt is 4 or 5)
         {
             _log("[Simulacrum] Re-approaching the initiator from a different angle...");
             var side = _gameState.PlayerGridPos +
-                       new Vector2(_waveClickAttempts == 4 ? 25 : -25, 12);
+                       new Vector2(attempt == 4 ? 25 : -25, 12);
             await _navigation.MoveToTarget(side, ct, 8);
         }
 
-        _log($"[Simulacrum] Clicking the wave initiator (attempt {_waveClickAttempts})...");
+        if (attempt == 1) BotLog.Step("[Simulacrum] Clicking the wave initiator...");
+        else _log($"[Simulacrum] Clicking the wave initiator (attempt {attempt})...");
         await _navigation.ClickEntity(aff, ct);
+        _waveClickAttempts = attempt;
+        _waveClickAt = Clock.NowMs;
         return SimPhase.StartingWave;
     }
 
@@ -479,6 +531,15 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         await _navigation.ReleaseMoveKey();
         await _gems.LevelReadyGems(ct);
         return true;
+    }
+
+    /// <summary>The initiator's counter wins — except during its ~1 s lag right
+    /// after a wave start we counted ourselves, when it still shows the previous
+    /// wave and would pull the count back by one.</summary>
+    private void SyncWaveCounter(RunContext run, Entity? aff)
+    {
+        if (Clock.SecondsSince(_waveCountedAt) < WaveNumberLagSeconds) return;
+        _initiator.SyncWaveNumber(run, aff);
     }
 
     private async SyncTask<SimPhase> DoFighting(RunContext run, CancellationToken ct)
@@ -513,13 +574,13 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // No targetable monsters nearby. The wave may be over, or spawns are elsewhere.
         var aff = _initiator.Find();
         var waveActive = _initiator.IsWaveActive(aff);
-        _initiator.SyncWaveNumber(run, aff);
+        SyncWaveCounter(run, aff);
 
         // The initiator's state flag is authoritative (verified live: active/wave = 1
         // during a wave, 0 when idle).
         if (waveActive == false)
         {
-            _initiator.LogStates(aff, $"wave {run.WavesStarted} cleared (initiator idle)");
+            _initiator.LogStates(aff, $"Wave {run.WavesStarted} cleared (initiator idle)");
             return SimPhase.LootPause;
         }
 
@@ -530,7 +591,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // pause like every other wave — StartingWave detects goodbye afterwards.
         if (waveActive != false && _sawServerMonstersThisWave && _gameState.MonstersRemaining == 0)
         {
-            _log("[Simulacrum] Server reports 0 monsters remaining -- moving to collect the wave loot.");
+            BotLog.Step("[Simulacrum] Server reports 0 monsters remaining -- moving to collect the wave loot.");
             _waveClickAt = Clock.Never;
             return SimPhase.LootPause;
         }
@@ -580,7 +641,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         if (_gameState.MonstersRemaining > 0 &&
             _hunt.FindNearestOutOfBubbleMonster() is { } lastKnown)
         {
-            _log($"[Simulacrum] Hunting a remaining monster last seen near {lastKnown}...");
+            BotLog.Step($"[Simulacrum] Hunting a remaining monster last seen near {lastKnown}...");
             await _navigation.MoveToTarget(lastKnown, ct, 30,
                 stopWhen: StopWhenMonstersNearby());
             return SimPhase.Fighting;
@@ -613,7 +674,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     /// then a short linger for late-spawning items. Returns the last pass result.
     /// </summary>
     private async SyncTask<LootResult> RunLootPasses(
-        Vector2? lootPoint, Func<bool>? abortWhen, CancellationToken ct)
+        RunContext run, Vector2? lootPoint, Func<bool>? abortWhen, CancellationToken ct)
     {
         var visitedLootPoint = false;
         // Anchored to the PAUSE START: the wave rewards materialize within a few
@@ -628,9 +689,54 @@ public sealed class SimulacrumStrategy : IFarmStrategy
 
             if (result == LootResult.InventoryFull)
             {
+                // The trip budget is spent and the in-area stash is unusable:
+                // re-running the deposit would be the same failing lap again.
+                // Leave the rest on the ground and let the wave go on.
+                if (_inAreaStashGivenUp)
+                {
+                    _log("[Simulacrum] Inventory is full and stashing is off for this run -- " +
+                         "leaving the remaining loot on the ground.");
+                    return LootResult.Incomplete;
+                }
+
                 _log("[Simulacrum] An item did not fit -- depositing, then re-looting.");
-                await StashInArea(ct);
-                continue;
+                var stashResult = await StashInArea(ct);
+                if (stashResult == StashResult.Ok)
+                    continue;
+
+                // Wrong dump-tab settings fail the hideout stash exactly the same
+                // way — a trip would only burn portals.
+                if (stashResult == StashResult.ConfigError)
+                {
+                    _inAreaStashGivenUp = true;
+                    _log("[Simulacrum] Stashing is blocked by the dump-tab settings -- no hideout trip " +
+                         "can fix that; leaving the remaining loot on the ground for this run.");
+                    return LootResult.Incomplete;
+                }
+
+                // In-area stashing failed after everything StashService can try.
+                // The escalation is NOT another lap of clicking: go out through
+                // the portal, empty the inventory in the hideout, and come back
+                // in through a remaining portal. The loot stays on the ground,
+                // and this pause resumes right here after the re-entry.
+                if (_stashTripsTaken < MaxStashTrips && run.PortalsRemaining >= MinPortalsForStashTrip)
+                {
+                    _stashTripsTaken++;
+                    _stashTripRequested = true;
+                    _log($"[Simulacrum] In-area stashing failed -- emptying the inventory in the " +
+                         $"hideout and coming back (trip {_stashTripsTaken}/{MaxStashTrips}, " +
+                         $"{run.PortalsRemaining} portals left).");
+                    return LootResult.Incomplete;
+                }
+
+                _inAreaStashGivenUp = true;
+                _log(_stashTripsTaken >= MaxStashTrips
+                    ? "[Simulacrum] In-area stashing failed and both hideout trips are spent -- " +
+                      "the waves go on, but loot that does not fit stays on the ground for this run."
+                    : $"[Simulacrum] In-area stashing failed and only {run.PortalsRemaining} portal(s) " +
+                      "are left (a trip needs 2) -- the waves go on, but loot that does not fit " +
+                      "stays on the ground for this run.");
+                return LootResult.Incomplete;
             }
 
             if (result != LootResult.AllPicked)
@@ -648,7 +754,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             {
                 if (Vector2.Distance(_gameState.PlayerGridPos, lootPoint.Value) > 90)
                 {
-                    _log("[Simulacrum] Checking the wave loot point before finishing the pause...");
+                    BotLog.Step("[Simulacrum] Checking the wave loot point before finishing the pause...");
                     await _navigation.MoveToTarget(lootPoint.Value, ct, 60,
                         stopWhen: WaitHelpers.Throttle(() =>
                         {
@@ -703,7 +809,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             if (!lateLoot)
                 return result;
 
-            _log("[Simulacrum] Late loot spawned -- picking it up.");
+            BotLog.Step("[Simulacrum] Late loot spawned -- picking it up.");
         }
 
         return result;
@@ -717,14 +823,30 @@ public sealed class SimulacrumStrategy : IFarmStrategy
         // for the labels to be detected.
         var lootPoint = _initiator.Find()?.GridPosNum ?? StartPoint;
 
-        var result = await RunLootPasses(lootPoint,
+        var result = await RunLootPasses(run, lootPoint,
             abortWhen: StopWhenMonstersNearby(), ct);
+
+        // Several of the pass loops end quietly on cancellation and hand back
+        // their last result — never act on a cut-short pause (gem clicks, the
+        // next wave) as if it had finished.
+        ct.ThrowIfCancellationRequested();
+
+        // A hideout stash trip is owed: the engine owns leaving and re-entering
+        // (ReEntryRequested), so hand it over and come back INTO the loot pause —
+        // the loot is still lying in the instance, waiting for a free inventory.
+        if (_stashTripRequested)
+        {
+            _stashTripRequested = false;
+            run.ReEntryRequested = true;
+            run.StashTripRequested = true;
+            return SimPhase.LootPause;
+        }
 
         // Monsters during looting are stragglers from the SAME wave (waves never
         // start on their own) — go fight them without counting a new wave.
         if (result == LootResult.Aborted || GetNearbyMonsters().Count > 0)
         {
-            _log("[Simulacrum] Monsters interrupted looting -- resuming the fight.");
+            BotLog.Step("[Simulacrum] Monsters interrupted looting -- resuming the fight.");
             return SimPhase.Fighting;
         }
 
@@ -787,7 +909,7 @@ public sealed class SimulacrumStrategy : IFarmStrategy
     /// in cannot loop the pause forever — the deposit attempt below then fails
     /// gracefully and the loot pass carries on with what fits.
     /// </summary>
-    private async SyncTask<bool> StashInArea(CancellationToken ct)
+    private async SyncTask<StashResult> StashInArea(CancellationToken ct)
     {
         if (_gameState.FindStash() == null)
         {
@@ -813,14 +935,14 @@ public sealed class SimulacrumStrategy : IFarmStrategy
             }
         }
 
-        var ok = await _stashService.Execute(ct) == StashResult.Ok;
+        var result = await _stashService.Execute(ct);
 
-        if (!ok && !_warnedInventoryFull)
+        if (result != StashResult.Ok && !_warnedInventoryFull)
         {
             _warnedInventoryFull = true;
-            _log("[Simulacrum] In-area stashing failed -- loot may be left behind.");
+            _log($"[Simulacrum] In-area stashing failed -- {_stashService.LastFailure ?? "unknown step"}.");
         }
-        return ok;
+        return result;
     }
 
     /// <summary>
@@ -911,7 +1033,9 @@ public sealed class SimulacrumStrategy : IFarmStrategy
                     if (Clock.MsSince(lastRecheck) > 250)
                     {
                         lastRecheck = Clock.NowMs;
-                        var best = _targets.Pick(GetNearbyMonsters());
+                        // Peek, never Pick: picking here would run the target hold
+                        // out mid-walk and swap targets behind the walk's back.
+                        var best = _targets.Peek(GetNearbyMonsters());
                         if (best != null && best.Id != target.Id)
                         {
                             if (TargetSelector.TargetScore(best) > currentScore)

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ExileCore;
+using ExileCore.PoEMemory;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared.Enums;
@@ -54,7 +55,7 @@ public sealed class GameStateService(GameController gc)
     /// host's cached view and unreliable outside a session.</summary>
     public bool IsLoadingState => SafeRead.Try("gs.loading-state", () => _gc.Game.IsLoadingState);
 
-    /// <summary>Whether the game window has OS focus — inputs only reach the game
+    /// <summary>Whether the game window has OS focus — OS input only reaches the game
     /// then (relevant for login-screen recovery, where nothing gates on InGame).</summary>
     public bool IsWindowForeground => SafeRead.Try("gs.window-foreground", () => _gc.Window.IsForeground());
 
@@ -93,6 +94,70 @@ public sealed class GameStateService(GameController gc)
             || ui.SettingsPanel?.IsVisible == true;
     });
 
+    private uint _trackedAreaHash;
+    private long _areaChangedAt = Clock.Never;
+
+    /// <summary>Seconds since the bot last saw the area change, either as a host
+    /// refresh (the plugin's AreaChange) or as a new area hash polled each Tick.
+    /// The host skips its area refresh when an area change follows the previous
+    /// one by less than ~5 s (measured over 125 death re-entries in the logs:
+    /// every re-entry under 5 s got no refresh). The farm-portal entry waits on
+    /// this so a quick hop back into the map is not left with unrefreshed host data.</summary>
+    public double SecondsSinceAreaChange => Clock.SecondsSince(_areaChangedAt);
+
+    /// <summary>The host refreshed the area (plugin AreaChange, which also fires on forced refreshes).</summary>
+    public void NoteAreaChange() => _areaChangedAt = Clock.NowMs;
+
+    /// <summary>Per-Tick poll: catches area changes the host did not refresh for
+    /// (CurrentArea itself still updates then).</summary>
+    public void TrackAreaChange()
+    {
+        var hash = SafeRead.Try("gs.area-hash", () => AreaHash);
+        if (hash == 0 || hash == _trackedAreaHash) return;
+        _trackedAreaHash = hash;
+        _areaChangedAt = Clock.NowMs;
+    }
+
+    private string? _characterName;
+    private string? _accountName;
+    private long _identityCheckAt;
+
+    /// <summary>"Character (Account)" of the logged-in player, for telling several
+    /// bots apart in one notification channel. Null until the first in-game read.
+    /// Keeps the last good value, so alerts raised while disconnected or on the
+    /// login screen still name the bot that sent them.</summary>
+    public string? PlayerIdentity { get; private set; }
+
+    /// <summary>Per-Tick, self-throttled to every 10 s: re-reads the character
+    /// name (a character switch goes through character select), and looks up the
+    /// account only when it is still unknown or the character changed. ExileCore
+    /// has no local account name; the local player is listed in
+    /// ServerData.KnownPlayers, matched by character name (unique game-wide).</summary>
+    public void TrackPlayerIdentity()
+    {
+        if (!Clock.Reached(_identityCheckAt)) return;
+        _identityCheckAt = Clock.InSeconds(10);
+        if (!IsReady) return;
+
+        var character = SafeRead.Try("gs.character-name",
+            () => _gc.Player?.GetComponent<Player>()?.PlayerName);
+        if (string.IsNullOrWhiteSpace(character)) return;
+
+        if (character != _characterName)
+        {
+            _characterName = character;
+            _accountName = null;
+        }
+
+        _accountName ??= SafeRead.Try("gs.account-name", () =>
+            _gc.IngameState?.Data?.ServerData?.KnownPlayers?
+                .FirstOrDefault(p => p?.CharacterName == character)?.AccountName);
+        if (string.IsNullOrWhiteSpace(_accountName))
+            _accountName = null;
+
+        PlayerIdentity = _accountName != null ? $"{_characterName} ({_accountName})" : _characterName;
+    }
+
     private long _lastAreaRefreshAt = Clock.Never;
 
     /// <summary>Force the host to re-read the current area and rebuild its caches
@@ -125,6 +190,59 @@ public sealed class GameStateService(GameController gc)
     /// its clicks without the device UI itself counting as "blocking".</summary>
     public bool HasPopupOpen =>
         SafeRead.Try("gs.popup-open", () => _gc.IngameState?.IngameUi?.PopUpWindow?.IsVisible == true);
+
+    /// <summary>
+    /// The screen area (window-relative) currently covered by click-swallowing UI:
+    /// the union of every visible popup / large / fullscreen panel the game tracks.
+    /// Empty when nothing readable is up — which does NOT prove the screen is
+    /// clear (the Simulacrum wave-start dialog is not in any of those lists), so
+    /// callers must treat it as a hint and still verify by hovering.
+    /// </summary>
+    public RectangleF BlockingUiRect => SafeRead.Try("gs.blocking-ui-rect", () =>
+    {
+        var ui = _gc.IngameState?.IngameUi;
+        if (ui == null) return RectangleF.Empty;
+
+        var union = RectangleF.Empty;
+        void Add(Element? e)
+        {
+            if (e?.IsVisible != true) return;
+            var r = e.GetClientRect();
+            if (r.Width <= 0 || r.Height <= 0) return;
+            union = union.IsEmpty ? r : RectangleF.Union(union, r);
+        }
+
+        Add(ui.PopUpWindow);
+        foreach (var p in ui.LargePanels ?? []) Add(p);
+        foreach (var p in ui.FullscreenPanels ?? []) Add(p);
+        return union;
+    });
+
+    /// <summary>
+    /// Screen displacement (window-relative pixels) that moving the character by a
+    /// GRID delta produces. The camera rides the character, so a world point's
+    /// screen position shifts by the NEGATIVE of this — which is what makes
+    /// "step aside so the target stops projecting under the panel" computable
+    /// without walking there first to look.
+    /// </summary>
+    public System.Numerics.Vector2 GridDeltaToScreenDelta(System.Numerics.Vector2 gridDelta)
+    {
+        const float gridToWorld = 250f / 23f;
+        var from = PlayerWorldPos;
+        var to = new System.Numerics.Vector3(
+            from.X + gridDelta.X * gridToWorld,
+            from.Y + gridDelta.Y * gridToWorld,
+            from.Z);
+        return WorldToScreen(to) - WorldToScreen(from);
+    }
+
+    /// <summary>The window-relative screen point an entity's interact center
+    /// projects to right now.</summary>
+    public System.Numerics.Vector2 EntityScreenPoint(Entity entity)
+    {
+        var center = entity.GetComponent<Render>()?.InteractCenterNum ?? entity.PosNum;
+        return WorldToScreen(center);
+    }
 
     /// <summary>
     /// One-line diagnosis of what the cursor is ACTUALLY on: the world entity

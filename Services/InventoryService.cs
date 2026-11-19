@@ -13,9 +13,21 @@ namespace NightmareAutomate.Services;
 /// Server inventories are matched by <see cref="InventorySlotE"/> value — never by list index,
 /// which is not stable (some slots are absent until their UI is opened).
 /// </summary>
-public sealed class InventoryService(GameController gc)
+public sealed class InventoryService(GameController gc, Func<bool> keepOmenOfAmelioration)
 {
     private readonly GameController _gc = gc;
+    private readonly Func<bool> _keepOmenOfAmelioration = keepOmenOfAmelioration;
+
+    /// <summary>Omen of Amelioration (stack size 1): consumed on death to prevent
+    /// 75% of the experience loss. Only one omen is consumed per player per
+    /// combat area.</summary>
+    public const string OmenOfAmeliorationPath = "Metadata/Items/Currency/AncestralOmenOnDeathPreventExpLoss";
+
+    public bool HasOmenOfAmelioration => FindMainInventoryItem(OmenOfAmeliorationPath) != null;
+
+    /// <summary>Items the bot carries on purpose — never offered to the stash dump.</summary>
+    private bool IsKeptItem(string path) =>
+        _keepOmenOfAmelioration() && path.Contains(OmenOfAmeliorationPath);
 
     /// <summary>The map device's single map/fragment slot.</summary>
     public const InventorySlotE MapDeviceMapSlot = InventorySlotE.Map1;
@@ -118,12 +130,13 @@ public sealed class InventoryService(GameController gc)
     }
 
     /// <summary>
-    /// Inventory items eligible for stash dumping — everything in the main inventory.
+    /// Inventory items eligible for stash dumping — everything in the main inventory
+    /// except the items the bot keeps on purpose (<see cref="IsKeptItem"/>).
     /// </summary>
     public IReadOnlyList<ServerInventory.InventSlotItem> GetDumpableItems()
     {
         return MainInventory?.InventorySlotItems?
-            .Where(s => s.Item?.Path != null)
+            .Where(s => s.Item?.Path != null && !IsKeptItem(s.Item.Path))
             .OrderBy(s => s.PosY).ThenBy(s => s.PosX)
             .ToList() ?? [];
     }

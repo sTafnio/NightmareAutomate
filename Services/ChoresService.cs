@@ -28,9 +28,9 @@ public enum ChoresResult
 
 /// <summary>
 /// Hideout chores between runs: gem level-ups, then ONE stash session covering
-/// everything that needs the panel — inventory dump, fragment restock — in that
-/// order (dump first frees space; restock last so the pulled fragment is not
-/// dumped right back).
+/// everything that needs the panel — inventory dump, fragment restock, omen
+/// restock — in that order (dump first frees space; restocks last so the pulled
+/// items are not dumped right back).
 ///
 /// The restock tab name comes from the active strategy (via the engine), not
 /// from a strategy-specific setting read here — this service stays farm-agnostic.
@@ -44,6 +44,12 @@ public sealed class ChoresService
     private readonly Action<string> _log;
 
     private long _gemAttemptAt = Clock.Never;
+
+    /// <summary>Whether to look for an Omen of Amelioration in the restock tab when
+    /// the inventory has none. Lowered when the tab turned out to hold none, so a
+    /// tab without omens is not reopened on every hideout visit; raised again by
+    /// <see cref="ArmOmenRestock"/> (session start, every death).</summary>
+    private bool _omenCheckArmed = true;
 
     /// <summary>The strategy's restock tab as last passed in — kept only so the
     /// parameterless latch checks (ConfigErrorStanding) can compare snapshots.</summary>
@@ -122,6 +128,29 @@ public sealed class ChoresService
     private bool NeedFragments(IReadOnlyList<string> fragmentPaths, string restockTabName) =>
         CanRestock(fragmentPaths, restockTabName) && fragmentPaths.Any(FragmentMissing);
 
+    /// <summary>The omen feature is on, a restock tab is set, and the inventory
+    /// holds no omen (a death consumed it, or the session started without one).</summary>
+    private bool OmenMissing(string restockTabName) =>
+        _settings.KeepOmenOfAmelioration &&
+        !string.IsNullOrWhiteSpace(restockTabName) &&
+        !_inventory.HasOmenOfAmelioration;
+
+    private bool NeedOmen(string restockTabName) => _omenCheckArmed && OmenMissing(restockTabName);
+
+    /// <summary>Look for an omen in the restock tab again (session start, and every
+    /// death — the death is what consumes it).</summary>
+    public void ArmOmenRestock() => _omenCheckArmed = true;
+
+    /// <summary>An omen should be fetched from the restock tab now. Honours the
+    /// config-error latch like the other stash-bound chores. Used by the engine
+    /// to decide on the hideout trip between a death and the re-entry.</summary>
+    public bool OmenRestockPending(string restockTabName)
+    {
+        _restockTabName = restockTabName;
+        RefreshConfigLatch();
+        return _configErrorSnapshot == null && NeedOmen(restockTabName);
+    }
+
     /// <summary>Whether a fragment restock from the stash tab is configured at all —
     /// the engine uses this to tell "out of fragments" apart from "restock never ran".</summary>
     public bool CanRestock(IReadOnlyList<string> fragmentPaths, string restockTabName) =>
@@ -149,23 +178,33 @@ public sealed class ChoresService
         _pendingCheckedAt = Clock.NowMs;
         return _pendingLast = NeedGems ||
                               (_configErrorSnapshot == null &&
-                               (NeedStash || NeedFragments(fragmentPaths, restockTabName)));
+                               (NeedStash || NeedFragments(fragmentPaths, restockTabName) ||
+                                NeedOmen(restockTabName)));
     }
 
     /// <summary>
     /// Run all pending chores. Stash-bound chores share one open-panel session.
+    ///
+    /// forceStash dumps the inventory even when it is not COMPLETELY full — for
+    /// the caller that came home from a live map for no other reason than to
+    /// empty it. A single item that does not fit (a 2x4 armour into three loose
+    /// cells) deadlocks looting exactly like a full inventory does, and
+    /// <see cref="UrgentStashPending"/> cannot see that from the hideout.
     /// </summary>
     public async SyncTask<ChoresResult> Run(
-        IReadOnlyList<string> fragmentPaths, string restockTabName, CancellationToken ct)
+        IReadOnlyList<string> fragmentPaths, string restockTabName, CancellationToken ct,
+        bool forceStash = false)
     {
         // While a config error stands, the stash-bound chores stay off (gems still
         // run) — re-attempting them would just re-fail and re-alert every visit.
         _restockTabName = restockTabName;
         RefreshConfigLatch();
         var configBlocked = _configErrorSnapshot != null;
-        var needStash = !configBlocked && NeedStash;
+        var needStash = !configBlocked &&
+                        (NeedStash || (forceStash && _inventory.GetDumpableItems().Count > 0));
         var needFragments = !configBlocked && NeedFragments(fragmentPaths, restockTabName);
-        if (!needStash && !needFragments)
+        var needOmen = !configBlocked && NeedOmen(restockTabName);
+        if (!needStash && !needFragments && !needOmen)
         {
             await LevelGemsIfPending(ct);
             return ChoresResult.Done;
@@ -198,7 +237,7 @@ public sealed class ChoresService
                 foreach (var path in fragmentPaths)
                 {
                     if (!FragmentMissing(path)) continue;
-                    _log($"[Chores] Restocking a fragment from tab '{restockTabName}'...");
+                    BotLog.Step($"[Chores] Restocking a fragment from tab '{restockTabName}'...");
                     var pull = await _stashService.PullItemFromTab(restockTabName, path, ct);
                     if (pull == PullResult.Empty)
                     {
@@ -213,6 +252,27 @@ public sealed class ChoresService
                         else failed = true;
                         break;
                     }
+                }
+            }
+
+            // Not skipped when the fragment tab read empty: that verdict no longer
+            // ends the session on the spot (a live run is finished first, and the
+            // engine confirms "empty" with a second look).
+            if (needOmen && !configError && OmenMissing(restockTabName))
+            {
+                switch (await RestockOmen(restockTabName, ct))
+                {
+                    case PullResult.ConfigError:
+                        LastFailureDetail = _stashService.LastFailure;
+                        configError = true;
+                        break;
+                    case PullResult.Failed:
+                        // A failed dump before this is the root cause: keep its detail.
+                        if (!failed)
+                            LastFailureDetail = _stashService.LastFailure ??
+                                                "Taking an Omen of Amelioration from the stash failed.";
+                        failed = true;
+                        break;
                 }
             }
         }
@@ -235,6 +295,84 @@ public sealed class ChoresService
         if (failed) return ChoresResult.Failed;
         LastFailureDetail = null;
         return ChoresResult.Done;
+    }
+
+    /// <summary>
+    /// The trip between a death and the re-entry: the Omen of Amelioration and
+    /// NOTHING else — no dump, no fragment restock, no gem level-ups. A live run
+    /// is waiting; everything else waits for the chores between runs. (A full
+    /// inventory never gets here: the engine sends that to the full chores first.)
+    /// </summary>
+    public async SyncTask<ChoresResult> RestockOmenOnly(string restockTabName, CancellationToken ct)
+    {
+        _restockTabName = restockTabName;
+        RefreshConfigLatch();
+        if (_configErrorSnapshot != null || !NeedOmen(restockTabName))
+            return ChoresResult.Done;
+
+        if (!await _stashService.OpenStashPanel(ct))
+        {
+            LastFailureDetail = _stashService.LastFailure;
+            return ChoresResult.Failed;
+        }
+
+        PullResult pull;
+        try
+        {
+            pull = await RestockOmen(restockTabName, ct);
+        }
+        finally
+        {
+            await _stashService.ClosePanel(ct);
+        }
+
+        switch (pull)
+        {
+            case PullResult.ConfigError:
+                LastFailureDetail = _stashService.LastFailure;
+                _configErrorSnapshot = ConfigSnapshot;
+                return ChoresResult.ConfigError;
+            case PullResult.Failed:
+                LastFailureDetail = _stashService.LastFailure ??
+                                    "Taking an Omen of Amelioration from the stash failed.";
+                return ChoresResult.Failed;
+            default:
+                // Pulled, or the tab holds none (RestockOmen disarmed the check).
+                LastFailureDetail = null;
+                return ChoresResult.Done;
+        }
+    }
+
+    /// <summary>
+    /// Take ONE Omen of Amelioration from the restock tab (stack size 1, so the
+    /// ctrl-click moves exactly one). A tab without omens is not a failure: the
+    /// session carries on without one, and the tab is only checked again after
+    /// the next death. In the full chores the dump runs first, so a full
+    /// inventory here means the dump failed, which is already reported.
+    /// </summary>
+    private async SyncTask<PullResult> RestockOmen(string restockTabName, CancellationToken ct)
+    {
+        if (_inventory.FreeMainInventoryCells() == 0)
+        {
+            _log("[Chores] No free inventory cell for an Omen of Amelioration -- skipping it this time.");
+            return PullResult.Failed;
+        }
+
+        BotLog.Step($"[Chores] Taking an Omen of Amelioration from tab '{restockTabName}'...");
+        var pull = await _stashService.PullItemFromTab(restockTabName, InventoryService.OmenOfAmeliorationPath, ct);
+        switch (pull)
+        {
+            case PullResult.Pulled:
+                _log("[Chores] Omen of Amelioration is back in the inventory.");
+                break;
+            case PullResult.Empty:
+                _omenCheckArmed = false;
+                _log($"[Chores] No Omen of Amelioration in tab '{restockTabName}' -- carrying on without " +
+                     "one (the tab is checked again after the next death).");
+                break;
+        }
+
+        return pull;
     }
 
     private async SyncTask<bool> LevelGemsIfPending(CancellationToken ct)

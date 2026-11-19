@@ -32,6 +32,13 @@ public sealed class RunContext
     /// to react to clicks. The run stays active; portals get consumed as usual.</summary>
     public bool ReEntryRequested { get; set; }
 
+    /// <summary>The strategy left the map specifically to EMPTY THE INVENTORY
+    /// (the in-area stash could not be opened). The engine must run the hideout
+    /// chores before re-entering — an item that merely does not FIT deadlocks
+    /// looting just as hard as a completely full inventory, and only this flag
+    /// tells the two apart from the hideout. Consumed by that chores pass.</summary>
+    public bool StashTripRequested { get; set; }
+
     /// <summary>Monotonic start of this run in Clock.NowMs terms (set on
     /// activation/adoption; 0 = never set). Deaths and hideout trips mid-run do
     /// NOT reset it — the abandon timer measures total time spent on the run,
@@ -49,6 +56,7 @@ public sealed class RunContext
         WavesStarted = 0;
         MapEntryPoint = null;
         ReEntryRequested = false;
+        StashTripRequested = false;
         RunStartedAt = Helpers.Clock.NowMs;
         AbandonedByTimer = false;
     }

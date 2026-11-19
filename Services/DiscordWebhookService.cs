@@ -32,10 +32,12 @@ public sealed class DiscordWebhookService : IDisposable
     private const int ColorSummary = 0x2ECC71;  // green
     private const int ColorTest = 0x5865F2;     // blurple
 
-    private sealed record QueuedEmbed(string Title, string Description, int Color, bool Mention, DateTime At);
+    private sealed record QueuedEmbed(
+        string Title, string Description, int Color, bool Mention, DateTime At, string? Sender);
 
     private readonly NightmareAutomateSettings _settings;
     private readonly Action<string> _log;
+    private readonly Func<string?> _sender;
     private readonly ConcurrentQueue<QueuedEmbed> _queue = new();
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private readonly CancellationTokenSource _cts = new();
@@ -44,10 +46,14 @@ public sealed class DiscordWebhookService : IDisposable
     private int _consecutiveFailures;
     private long _disabledUntil; // 0 = not paused (monotonic deadline)
 
-    public DiscordWebhookService(NightmareAutomateSettings settings, Action<string> log)
+    /// <param name="sender">"Character (Account)" shown as each embed's author line,
+    /// so several bots can share one channel. Read on the caller's (game) thread at
+    /// enqueue time; null omits the line.</param>
+    public DiscordWebhookService(NightmareAutomateSettings settings, Action<string> log, Func<string?> sender)
     {
         _settings = settings;
         _log = log;
+        _sender = sender;
     }
 
     public void NotifyCritical(string title, string message)
@@ -85,7 +91,7 @@ public sealed class DiscordWebhookService : IDisposable
         if (string.IsNullOrWhiteSpace(_settings.DiscordWebhookUrl)) return;
         if (!Clock.Reached(_disabledUntil)) return;
 
-        _queue.Enqueue(new QueuedEmbed(title, description, color, mention, DateTime.Now));
+        _queue.Enqueue(new QueuedEmbed(title, description, color, mention, DateTime.Now, _sender()));
         EnsureWorker();
     }
 
@@ -142,6 +148,7 @@ public sealed class DiscordWebhookService : IDisposable
             content = batch.Any(b => b.Mention) && !string.IsNullOrWhiteSpace(mention) ? mention : null,
             embeds = batch.Select(b => new
             {
+                author = string.IsNullOrWhiteSpace(b.Sender) ? null : new { name = b.Sender },
                 title = b.Title,
                 description = b.Description,
                 color = b.Color,
@@ -176,12 +183,15 @@ public sealed class DiscordWebhookService : IDisposable
                 _log($"[Discord] Webhook returned HTTP {(int)response.StatusCode}.");
                 break;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
-                throw;
+                throw; // plugin shutdown
             }
             catch (Exception ex)
             {
+                // Includes HttpClient's own timeout (a TaskCanceledException with
+                // our token NOT cancelled) — a failed post, not a shutdown: it must
+                // count, and the worker must live on.
                 _log($"[Discord] Webhook post failed: {ex.Message}");
                 break;
             }

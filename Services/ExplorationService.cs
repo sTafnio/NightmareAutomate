@@ -42,6 +42,12 @@ public sealed class ExplorationService
     private Task<IReadOnlyList<Vector2>>? _buildTask;
     private int _tourIndex;
 
+    /// <summary>Walks toward the current tour point that ended short of it. A
+    /// point with no route (or one the walk keeps stalling on) never comes within
+    /// arrival range — without this it would be retried forever.</summary>
+    private int _failedLegs;
+    private const int MaxFailedLegsPerPoint = 2;
+
     public ExplorationService(GameStateService gameState, NavigationService navigation, Action<string> log)
     {
         _gameState = gameState;
@@ -69,10 +75,22 @@ public sealed class ExplorationService
         if (Vector2.Distance(_gameState.PlayerGridPos, point) < 25)
         {
             _tourIndex++;
+            _failedLegs = 0;
             return true;
         }
 
-        await _navigation.MoveToTarget(point, ct, 20, stopWhen: found);
+        var arrived = await _navigation.MoveToTarget(point, ct, 20, stopWhen: found);
+        if (arrived || found())
+        {
+            _failedLegs = 0;
+        }
+        else if (++_failedLegs >= MaxFailedLegsPerPoint)
+        {
+            _log($"[Explore] Tour point {point} is unreachable -- skipping it.");
+            _tourIndex++;
+            _failedLegs = 0;
+        }
+
         return true;
     }
 
@@ -117,6 +135,7 @@ public sealed class ExplorationService
             _builtAt = Clock.NowMs;
             _tour = null;
             _tourIndex = 0;
+            _failedLegs = 0;
             var seed = _gameState.PlayerGridPos;
             _buildTask = Task.Run(() => Build(terrain, seed));
         }

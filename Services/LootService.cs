@@ -146,13 +146,17 @@ public sealed class LootService
     public bool HasKnownLoot() => _rememberedSpots.Count > 0 || GetWantedLabels().Count > 0;
 
     /// <summary>
-    /// Pick up everything known until done, aborted, or out of space. No wall-clock
-    /// timeout: every item ends in picked / deferred / given-up, so the loop
-    /// terminates on its own.
+    /// Pick up everything known until done, aborted, or out of space. Every item
+    /// ends in picked / deferred / given-up, so the loop terminates on its own;
+    /// a generous wall-clock backstop still ends it as Incomplete should some
+    /// item keep cycling through those states (labels reflowing, spots
+    /// re-observed). Cancellation propagates — a cut-short window is not a
+    /// finished one.
     /// </summary>
     public async SyncTask<LootResult> PickupWindow(Func<bool>? abortWhen, CancellationToken ct)
     {
         const int maxRetryRounds = 2;
+        var windowDeadline = Clock.InMinutes(5);
 
         var deferred = new HashSet<uint>();
         var failedClicks = new Dictionary<uint, int>();
@@ -172,6 +176,13 @@ public sealed class LootService
                 return LootResult.Aborted;
             }
 
+            if (Clock.Reached(windowDeadline))
+            {
+                _log("[Loot] Pickup window ran for 5 minutes -- leaving the rest for now.");
+                await _navigation.ReleaseMoveKey();
+                return LootResult.Incomplete;
+            }
+
             ObserveGroundLoot();
 
             var labels = GetWantedLabels(deferred);
@@ -182,7 +193,7 @@ public sealed class LootService
                 if (spot != null)
                 {
                     var (id, pos) = spot.Value;
-                    _log($"[Loot] Walking to a remembered drop at {pos}...");
+                    BotLog.Step($"[Loot] Walking to a remembered drop at {pos}...");
                     var reached = await _navigation.MoveToTarget(pos, ct, 12);
                     if (!reached || LabelGone(id))
                         _rememberedSpots.Remove(id); // gone (picked/never real) or unreachable
@@ -216,7 +227,7 @@ public sealed class LootService
                     }
                     else
                     {
-                        _log($"[Loot] Retrying {deferred.Count} skipped items (round {retryRound}).");
+                        BotLog.Step($"[Loot] Retrying {deferred.Count} skipped items (round {retryRound}).");
                     }
 
                     deferred.Clear();
@@ -360,7 +371,7 @@ public sealed class LootService
 
             if (!targeted)
             {
-                _log($"[Loot] Item never highlighted under cursor -- deferring it ({groundEntity.Path}).");
+                _log("[Loot] An item didn't highlight -- retrying it later.");
                 deferred.Add(groundEntity.Id);
                 continue;
             }
@@ -395,6 +406,7 @@ public sealed class LootService
         }
 
         await _navigation.ReleaseMoveKey();
+        ct.ThrowIfCancellationRequested();
         return HasKnownLoot() ? LootResult.Incomplete : LootResult.AllPicked;
     }
 
@@ -402,9 +414,9 @@ public sealed class LootService
     /// Walk on top of each failed item (path-based arrival — it may sit behind a
     /// wall edge) and try one more hover+click from point-blank. Standing on the
     /// item gives a completely different projection than the failed from-range
-    /// attempts. The highlight is still awaited but the click goes out regardless —
-    /// this is the last try before the item is abandoned. Picked items are removed
-    /// from the failed set.
+    /// attempts. Still never clicks blind: no highlight means something else is
+    /// under the cursor (a portal would cost a map portal), so the item is
+    /// abandoned instead. Picked items are removed from the failed set.
     /// </summary>
     private async SyncTask<int> LastChancePass(HashSet<uint> failedIds, Func<bool>? abortWhen, CancellationToken ct)
     {
@@ -442,8 +454,13 @@ public sealed class LootService
                 continue;
 
             await _input.MoveMouse(_input.RandomScreenPoint(label.ClientRect), ct);
-            await Helpers.WaitHelpers.For(
-                () => groundEntity.GetComponent<Targetable>()?.isTargeted == true, 600, ct);
+            if (!await Helpers.WaitHelpers.For(
+                    () => groundEntity.GetComponent<Targetable>()?.isTargeted == true, 600, ct))
+            {
+                _log($"[Loot] Last chance: item never highlighted -- not clicking ({groundEntity.Path}).");
+                continue;
+            }
+
             await _input.Click(MouseButtons.Left, ct);
             await Helpers.WaitHelpers.For(() => LabelGone(id), 3000, ct);
 
@@ -502,10 +519,22 @@ public sealed class LootService
     private async SyncTask<bool> ToggleLabels(CancellationToken ct)
     {
         var key = _getToggleLabelsKey();
+        var shownBefore = GetWantedLabels().Count;
         await _input.PressKey(key, ct);
         await Task.Delay(100, ct);
         await _input.PressKey(key, ct);
         await Task.Delay(300, ct);
+
+        // One press that did not land leaves every label HIDDEN — the pickup loop
+        // would then see an empty ground and report AllPicked with the loot still
+        // lying there. Labels that were up must be up again.
+        if (shownBefore > 0 && GetWantedLabels().Count == 0)
+        {
+            _log("[Loot] Labels did not come back after the re-render -- pressing the toggle once more.");
+            await _input.PressKey(key, ct);
+            await Task.Delay(300, ct);
+        }
+
         return true;
     }
 }

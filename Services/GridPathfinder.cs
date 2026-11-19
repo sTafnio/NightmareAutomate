@@ -22,8 +22,14 @@ namespace NightmareAutomate.Services;
 ///    whenever the target drifts or the player strays outside coverage.
 ///
 /// Paths are extracted from the field by steepest descent (O(path length),
-/// no re-search however far the player deviates between rebuilds) and streamed
-/// through the callback every <see cref="RepathIntervalMs"/>.
+/// no re-search however far the player deviates between rebuilds) and
+/// refreshed every <see cref="RepathIntervalMs"/>.
+///
+/// Threading: a walk drives its <see cref="RouteTracker"/> from the game thread
+/// (the SyncTask pump), so every game read — target, player position, terrain —
+/// happens there. Only the flood itself runs on the thread pool, over the
+/// terrain array snapshot and a buffer no other walk touches while it runs
+/// (same split as ExplorationService's tour build).
 /// </summary>
 public sealed class GridPathfinder
 {
@@ -45,63 +51,143 @@ public sealed class GridPathfinder
 
     private readonly GameController _gc;
 
-    // A field over a map grid is several MB; walks are strictly sequential
-    // (NavigationService awaits the routing task before returning), so a single
-    // reused buffer avoids per-walk allocation churn.
-    private int[] _dist = [];
+    // A field over a map grid is several MB. Walks are sequential, so one spare
+    // buffer is handed from walk to walk — but only back once no flood can still
+    // be writing it (an abandoned walk's flood finishes on its own; the next
+    // walk then simply allocates).
+    private int[]? _spareBuffer;
 
     public GridPathfinder(GameController gc) => _gc = gc;
 
     /// <summary>
-    /// Runs until cancelled, repeatedly invoking the callback with the remaining
-    /// path (player → target, one Vector2i per grid cell). Completes on its own
-    /// when no route exists or the player is standing on the target.
+    /// Start routing in the current area. Null when the terrain is not readable
+    /// (loading, stale host). Dispose the tracker when the walk ends.
     /// </summary>
-    public async Task LookForRoute(Func<Vector2> getTarget, Action<List<Vector2i>> onPathFound, CancellationToken ct)
+    public RouteTracker? BeginRoute()
     {
         var terrain = SafeRead.Try("path.terrain", () => _gc.IngameState?.Data?.RawPathfindingData);
-        if (terrain == null || terrain.Length == 0) return;
+        if (terrain == null || terrain.Length == 0) return null;
+        return new RouteTracker(this, terrain);
+    }
 
-        var rows = terrain.Length;
-        var cols = terrain[0].Length;
+    private int[] TakeBuffer(int size)
+    {
+        var buffer = _spareBuffer;
+        _spareBuffer = null;
+        return buffer != null && buffer.Length >= size ? buffer : new int[size];
+    }
 
-        bool Walkable(int x, int y) => TerrainGrid.IsWalkable(terrain, rows, x, y);
+    private void ReturnBuffer(int[] buffer) => _spareBuffer = buffer;
 
-        int[]? dist = null;
-        var fullyFlooded = false;
-        var fieldAnchor = Vector2.Zero;
+    /// <summary>
+    /// One walk's route toward a live target. Call <see cref="Update"/> once per
+    /// frame from the game thread; <see cref="Path"/> holds the latest route
+    /// (player → target, one cell per step). <see cref="Finished"/> turns true
+    /// when no route exists or the player stands on the target.
+    /// </summary>
+    public sealed class RouteTracker : IDisposable
+    {
+        private readonly GridPathfinder _owner;
+        private readonly int[][] _terrain;
+        private readonly int _rows;
+        private readonly int _cols;
+        private readonly CancellationTokenSource _floodCts = new();
 
-        while (!ct.IsCancellationRequested)
+        private int[]? _dist;
+        private Task<bool>? _flood;     // result: the whole reachable component was flooded
+        private bool _fieldReady;
+        private bool _fullyFlooded;
+        private Vector2 _fieldAnchor;
+        private long _nextRepathAt;
+
+        internal RouteTracker(GridPathfinder owner, int[][] terrain)
         {
-            var targetNow = getTarget();
-            var playerPos = _gc.Player?.GridPosNum ?? Vector2.Zero;
+            _owner = owner;
+            _terrain = terrain;
+            _rows = terrain.Length;
+            _cols = terrain[0].Length;
+        }
 
-            if (dist == null || Vector2.Distance(fieldAnchor, targetNow) > GoalDriftCells)
+        public List<Vector2i>? Path { get; private set; }
+        public bool Finished { get; private set; }
+
+        private bool Walkable(int x, int y) => TerrainGrid.IsWalkable(_terrain, _rows, x, y);
+
+        /// <summary>Advance the route with this frame's target and player cell.</summary>
+        public void Update(Vector2 target, Vector2 player)
+        {
+            if (Finished) return;
+
+            var justFlooded = false;
+            if (_flood != null)
             {
-                var goal = TerrainGrid.Spiral((int)targetNow.X, (int)targetNow.Y, rows, cols, SnapRadius, Walkable);
-                if (goal == null) return;
-                fieldAnchor = targetNow;
+                if (!_flood.IsCompleted) return;
+                if (!_flood.IsCompletedSuccessfully)
+                {
+                    // A flood can only fault on a malformed grid — no route.
+                    SafeRead.Note("path.flood", _flood.Exception?.GetBaseException()
+                                                ?? new OperationCanceledException());
+                    Finished = true;
+                    return;
+                }
 
-                var start = TerrainGrid.Spiral((int)playerPos.X, (int)playerPos.Y, rows, cols, SnapRadius, Walkable);
-                (dist, fullyFlooded) = await Task.Run(
-                    () => BuildDistanceField(terrain, rows, cols, goal.Value, start), ct);
+                _fullyFlooded = _flood.Result;
+                _flood = null;
+                _fieldReady = true;
+                _nextRepathAt = 0;
+                justFlooded = true;
             }
 
-            var path = ExtractPath(dist, rows, cols, (int)playerPos.X, (int)playerPos.Y);
+            // A freshly finished field always yields a path first, even if the
+            // live target drifted meanwhile: a fast mover could otherwise outrun
+            // every flood and starve the walk of paths (leaving only the straight
+            // nudge). The drift re-flood then happens on the next update.
+            if (!_fieldReady || (!justFlooded && Vector2.Distance(_fieldAnchor, target) > GoalDriftCells))
+            {
+                var goal = TerrainGrid.Spiral((int)target.X, (int)target.Y, _rows, _cols, SnapRadius, Walkable);
+                if (goal == null)
+                {
+                    Finished = true;
+                    return;
+                }
+
+                _fieldAnchor = target;
+                _fieldReady = false;
+                var start = TerrainGrid.Spiral((int)player.X, (int)player.Y, _rows, _cols, SnapRadius, Walkable);
+                var dist = _dist ??= _owner.TakeBuffer(_rows * _cols);
+                var (terrain, rows, cols, token) = (_terrain, _rows, _cols, _floodCts.Token);
+                _flood = Task.Run(
+                    () => BuildDistanceField(terrain, rows, cols, goal.Value, start, dist, token), token);
+                return;
+            }
+
+            if (!Clock.Reached(_nextRepathAt)) return;
+            _nextRepathAt = Clock.InMs(RepathIntervalMs);
+
+            var path = ExtractPath(_dist!, _rows, _cols, (int)player.X, (int)player.Y);
             if (path == null)
             {
                 // Player outside the flooded neighborhood — widen by re-flooding
                 // around the current position. If the field already covers the
                 // whole reachable component, there is genuinely no route.
-                if (fullyFlooded) return;
-                dist = null;
-                continue;
+                if (_fullyFlooded)
+                    Finished = true;
+                else
+                    _fieldReady = false;
+                return;
             }
 
-            if (path.Count == 0) return; // standing on the target
-            onPathFound(path);
+            Path = path;
+            if (path.Count == 0)
+                Finished = true; // standing on the target
+        }
 
-            await Task.Delay(RepathIntervalMs, ct);
+        public void Dispose()
+        {
+            _floodCts.Cancel();
+            if (_dist != null && _flood is null or { IsCompleted: true })
+                _owner.ReturnBuffer(_dist);
+            _dist = null;
         }
     }
 
@@ -110,14 +196,13 @@ public sealed class GridPathfinder
     /// require both adjacent cardinals walkable so paths never cut corners.
     /// Expansion stops early once the start cell settles (plus slack) — the
     /// early exit is safe for descent because every cell at distance ≤ budget
-    /// is fully settled when we stop.
+    /// is fully settled when we stop. Abandoned walks cancel it (checked every
+    /// few thousand cells), so it never outlives its walk by much.
     /// </summary>
-    private (int[] Dist, bool FullyFlooded) BuildDistanceField(
-        int[][] terrain, int rows, int cols, Vector2i goal, Vector2i? start)
+    private static bool BuildDistanceField(
+        int[][] terrain, int rows, int cols, Vector2i goal, Vector2i? start, int[] dist, CancellationToken ct)
     {
         var size = rows * cols;
-        if (_dist.Length < size) _dist = new int[size];
-        var dist = _dist;
         Array.Fill(dist, Unreached, 0, size);
 
         bool Walkable(int x, int y) => TerrainGrid.IsWalkable(terrain, rows, x, y);
@@ -129,11 +214,14 @@ public sealed class GridPathfinder
 
         var startIdx = start.HasValue ? start.Value.Y * cols + start.Value.X : -1;
         var budget = long.MaxValue;
+        var expanded = 0;
 
         while (open.TryDequeue(out var idx, out var d))
         {
+            if ((++expanded & 4095) == 0)
+                ct.ThrowIfCancellationRequested();
             if (d != dist[idx]) continue; // stale queue entry
-            if (d > budget) return (dist, false);
+            if (d > budget) return false;
             if (idx == startIdx)
                 budget = (long)(d * CoverageSlackFactor) + CoverageSlackCells * CardinalCost;
 
@@ -158,7 +246,7 @@ public sealed class GridPathfinder
             }
         }
 
-        return (dist, true);
+        return true;
     }
 
     /// <summary>

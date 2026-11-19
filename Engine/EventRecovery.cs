@@ -15,6 +15,13 @@ namespace NightmareAutomate.Engine;
 /// </summary>
 public sealed class EventRecovery
 {
+    /// <summary>Dead this long with the resurrect option not working: alert.</summary>
+    private const int DeadAlertSeconds = 60;
+
+    /// <summary>Dead this long: nothing left to try — stop the session loudly
+    /// instead of clicking at a death screen all night.</summary>
+    private const int DeadGiveUpSeconds = 300;
+
     private readonly GameStateService _gameState;
     private readonly InputService _input;
     private readonly DiscordWebhookService _webhook;
@@ -117,16 +124,36 @@ public sealed class EventRecovery
         _log("Handling death... waiting for resurrect.");
 
         var deathHandlingSince = Clock.NowMs;
+        var stuckNotified = false;
         while (!ct.IsCancellationRequested && _gameState.IsPlayerDead)
         {
+            var deadFor = Clock.SecondsSince(deathHandlingSince);
+            if (deadFor > DeadGiveUpSeconds)
+            {
+                _log($"Still dead after {DeadGiveUpSeconds / 60} minutes -- giving up.");
+                _webhook.NotifyCritical("Stuck dead",
+                    $"The character has been dead for {DeadGiveUpSeconds / 60} minutes and no resurrect " +
+                    "option worked -- stopping the session.");
+                return BotState.Finished;
+            }
+
+            if (deadFor > DeadAlertSeconds && !stuckNotified)
+            {
+                stuckNotified = true;
+                _webhook.NotifyCritical("Still dead",
+                    $"Dead for over {DeadAlertSeconds}s -- the resurrect button was not found or did not work. " +
+                    $"Retrying; the session stops after {DeadGiveUpSeconds / 60} minutes.");
+            }
+
             // Checkpoint resurrection spawns us in the hideout; town does not. Only
             // fall back to any resurrect option if no checkpoint button shows up.
-            var allowFallback = Clock.SecondsSince(deathHandlingSince) > 15;
+            var allowFallback = deadFor > 15;
             await TryClickResurrect(allowFallback, ct);
             await Task.Delay(500, ct);
         }
 
-        if (ct.IsCancellationRequested) return BotState.Error;
+        // A cut-short handler is re-run, not a failure (the engine resumes it).
+        ct.ThrowIfCancellationRequested();
 
         _log("Player alive again. Waiting for area to stabilize...");
         await Task.Delay(2000, ct);
@@ -138,7 +165,9 @@ public sealed class EventRecovery
     /// Click the resurrect button on the death panel -- "Resurrect at Checkpoint"
     /// (spawns in the hideout), never "Resurrect in Town" unless the checkpoint
     /// option never appears (allowFallback).
-    /// TODO(live-verify): confirm the button texts on the first real death.
+    /// Verified live 2026-11-14: the labels ('resurrect at checkpoint', 'resurrect
+    /// in town') are in Element.Text; TextNoTags is empty on them (and on almost
+    /// every other UI element in this HUD build).
     /// </summary>
     private async SyncTask<bool> TryClickResurrect(bool allowFallback, CancellationToken ct)
     {
@@ -146,13 +175,13 @@ public sealed class EventRecovery
         if (panel == null || !panel.IsVisible) return false;
 
         var button = panel.FindChildRecursive(e =>
-            e.IsVisible && e.TextNoTags?.Contains("Checkpoint", StringComparison.OrdinalIgnoreCase) == true, 8, 0);
+            e.IsVisible && LabelOf(e).Contains("Checkpoint", StringComparison.OrdinalIgnoreCase), 8, 0);
 
         if (button == null && allowFallback)
         {
             _log("No checkpoint resurrect option found -- falling back to any resurrect button.");
             button = panel.FindChildRecursive(e =>
-                e.IsVisible && e.TextNoTags?.Contains("Resurrect", StringComparison.OrdinalIgnoreCase) == true, 8, 0);
+                e.IsVisible && LabelOf(e).Contains("Resurrect", StringComparison.OrdinalIgnoreCase), 8, 0);
         }
 
         if (button == null) return false;
@@ -161,10 +190,17 @@ public sealed class EventRecovery
         // instant it appears can be swallowed or hit a shifting layout.
         await Task.Delay(1000, ct);
 
-        _log($"Clicking resurrect button ('{button.TextNoTags}')...");
+        _log($"Clicking resurrect button ('{LabelOf(button)}')...");
         await _input.ClickRect(button.GetClientRectCache, MouseButtons.Left, ct);
         await Task.Delay(1000, ct);
         return true;
+    }
+
+    /// <summary>An element's visible label: Text, or TextNoTags if Text is empty.</summary>
+    private static string LabelOf(ExileCore.PoEMemory.Element e)
+    {
+        var text = e.Text;
+        return string.IsNullOrEmpty(text) ? e.TextNoTags ?? "" : text;
     }
 
     /// <summary>
@@ -177,14 +213,16 @@ public sealed class EventRecovery
     /// are not contractual outside a session and must never starve the presses.
     /// Enter goes through raw OS input (no InputHumanizer: it is a bridge into
     /// another plugin, not guaranteed to serve out of game), and only when the
-    /// game window has OS focus -- keys would go elsewhere otherwise.
+    /// game window has OS focus -- keys would go elsewhere otherwise. Background
+    /// input can't land anywhere else, so it goes through the pipe at any time.
     /// </summary>
     public async SyncTask<BotState> HandleDisconnect(CancellationToken ct)
     {
         var maxAttempts = _getMaxReconnectAttempts();
-        _log("Handling disconnect... pressing Enter to log back in (window must be focused).");
+        var whileFocused = _input.IsBackgroundInput ? "" : " while the game window is focused";
+        _log($"Handling disconnect... pressing Enter to log back in{whileFocused}.");
         _webhook.NotifyCritical("Disconnected",
-            "Connection lost. Auto-relogin presses Enter while the game window is focused " +
+            $"Connection lost. Auto-relogin presses Enter{whileFocused} " +
             "(every 5s at first, backing off to 30s). " +
             (maxAttempts > 0
                 ? $"Gives up after {maxAttempts} attempts."
@@ -210,7 +248,7 @@ public sealed class EventRecovery
                     < 60 => TimeSpan.FromMinutes(60),
                     _ => nextReminder + TimeSpan.FromMinutes(60)
                 };
-                var focusNote = _gameState.IsWindowForeground
+                var focusNote = _gameState.IsWindowForeground || _input.IsBackgroundInput
                     ? ""
                     : " The game window is NOT focused -- no keys can be pressed until it is.";
                 _webhook.NotifyCritical("Still disconnected",
@@ -225,7 +263,7 @@ public sealed class EventRecovery
                 continue;
             }
 
-            if (!_gameState.IsWindowForeground)
+            if (!_gameState.IsWindowForeground && !_input.IsBackgroundInput)
             {
                 if (!warnedBackground)
                 {
@@ -265,13 +303,13 @@ public sealed class EventRecovery
                 lastEnterAt = Clock.NowMs;
                 _log("Still disconnected -- pressing Enter (attempt " +
                      $"{attempts}{(maxAttempts > 0 ? $"/{maxAttempts}" : "")})...");
-                await _input.PressKeyRaw(Keys.Enter, ct);
+                await _input.PressKeyOutOfGame(Keys.Enter, ct);
             }
 
             await Task.Delay(500, ct);
         }
 
-        if (ct.IsCancellationRequested) return BotState.Error;
+        ct.ThrowIfCancellationRequested();
 
         _log("Reconnected. Waiting for the game to become ready...");
         _webhook.NotifyCritical("Reconnected", "Back in game -- resuming the loop.");

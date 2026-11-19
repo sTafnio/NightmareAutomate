@@ -70,48 +70,12 @@ public sealed class TargetSelector
 
     public Entity? Pick(IReadOnlyList<Entity> monsters)
     {
-        // Benched targets sit out until their skip expires. If that leaves
-        // nothing, we idle quietly (ReAgent still fights whatever is near)
-        // instead of re-walking into the same wall.
-        if (_skipUntil.Count > 0)
-        {
-            foreach (var expired in _skipUntil.Where(kv => Clock.Reached(kv.Value)).Select(kv => kv.Key).ToList())
-                _skipUntil.Remove(expired);
-            if (_skipUntil.Count > 0)
-                monsters = monsters.Where(m => !_skipUntil.ContainsKey(m.Id)).ToList();
-        }
-
-        if (monsters.Count == 0)
+        var best = Rank(monsters, out var pool);
+        if (best == null)
         {
             _currentTargetId = 0;
             return null;
         }
-
-        var playerPos = _gameState.PlayerGridPos;
-        float nearRadius = _settings.NearTargetRadius;
-
-        var near = monsters
-            .Where(m => Vector2.Distance(playerPos, m.GridPosNum) <= nearRadius)
-            .ToList();
-        var pool = near.Count > 0 ? near : monsters;
-
-        EnsureClusterCounts(monsters);
-
-        float Dist(Entity m) => Vector2.Distance(playerPos, m.GridPosNum);
-
-        // Rarity blended with pack size: one rarity step is worth PackSizePerTier
-        // clustered monsters (lone rare = 2 steps, so a magic with a pack of
-        // PackSizePerTier+1 around it wins; a white pack needs 2x+1).
-        var packWeight = Math.Max(1, _settings.PackSizePerTier);
-        int PackScore(Entity m) => (int)m.Rarity * packWeight + _clusterCounts.GetValueOrDefault(m.Id);
-
-        // Priority tier first (totems, then uniques — always on top), then the
-        // blended pack score, distance as the final tie-break.
-        var best = pool
-            .OrderByDescending(TargetScore)
-            .ThenByDescending(PackScore)
-            .ThenBy(Dist)
-            .First();
 
         // Time-based stickiness: hold the current target briefly so equal picks
         // can't ping-pong between frames. A current target outside the pool
@@ -133,6 +97,65 @@ public sealed class TargetSelector
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// The best candidate by the same ranking as <see cref="Pick"/>, WITHOUT the
+    /// stickiness and without touching the current target — for look-ahead
+    /// checks ("did something better appear?" inside an engage walk). Pick there
+    /// would let the hold run out mid-walk and switch the current target while
+    /// the walk keeps going to the old one; on arrival the bot would then turn
+    /// away from the target it just reached.
+    /// </summary>
+    public Entity? Peek(IReadOnlyList<Entity> monsters) => Rank(monsters, out _);
+
+    /// <summary>
+    /// Near-first pool + priority tier + blended pack score + distance. The only
+    /// state it touches is expiring bench entries.
+    /// </summary>
+    private Entity? Rank(IReadOnlyList<Entity> monsters, out IReadOnlyList<Entity> pool)
+    {
+        pool = [];
+
+        // Benched targets sit out until their skip expires. If that leaves
+        // nothing, we idle quietly (ReAgent still fights whatever is near)
+        // instead of re-walking into the same wall.
+        if (_skipUntil.Count > 0)
+        {
+            foreach (var expired in _skipUntil.Where(kv => Clock.Reached(kv.Value)).Select(kv => kv.Key).ToList())
+                _skipUntil.Remove(expired);
+            if (_skipUntil.Count > 0)
+                monsters = monsters.Where(m => !_skipUntil.ContainsKey(m.Id)).ToList();
+        }
+
+        if (monsters.Count == 0)
+            return null;
+
+        var playerPos = _gameState.PlayerGridPos;
+        float nearRadius = _settings.NearTargetRadius;
+
+        var near = monsters
+            .Where(m => Vector2.Distance(playerPos, m.GridPosNum) <= nearRadius)
+            .ToList();
+        pool = near.Count > 0 ? near : monsters;
+
+        EnsureClusterCounts(monsters);
+
+        float Dist(Entity m) => Vector2.Distance(playerPos, m.GridPosNum);
+
+        // Rarity blended with pack size: one rarity step is worth PackSizePerTier
+        // clustered monsters (lone rare = 2 steps, so a magic with a pack of
+        // PackSizePerTier+1 around it wins; a white pack needs 2x+1).
+        var packWeight = Math.Max(1, _settings.PackSizePerTier);
+        int PackScore(Entity m) => (int)m.Rarity * packWeight + _clusterCounts.GetValueOrDefault(m.Id);
+
+        // Priority tier first (totems, then uniques — always on top), then the
+        // blended pack score, distance as the final tie-break.
+        return pool
+            .OrderByDescending(TargetScore)
+            .ThenByDescending(PackScore)
+            .ThenBy(Dist)
+            .First();
     }
 
     /// <summary>

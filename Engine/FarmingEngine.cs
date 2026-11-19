@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -42,6 +43,28 @@ public sealed class FarmingEngine
     /// would waste hours.</summary>
     private const int MaxMapDeviceFailures = 10;
 
+    /// <summary>Portal entries (click + transition) failing in a row that stop the
+    /// session — same failsafe shape as the map device: a portal that keeps
+    /// refusing must not cycle WaitingForPortal/EnteringMap forever.</summary>
+    private const int MaxPortalEntryFailures = 8;
+
+    /// <summary>Same failsafe for the way home: the town portal out of the map,
+    /// and the hideout key in town.</summary>
+    private const int MaxReturnFailures = 10;
+
+    /// <summary>Minimum age of the current area before a farm portal is clicked.
+    /// The host skips its area refresh for changes under ~5 s apart; the click
+    /// happens about 2 s before the map arrives, so 6 s here puts the arrival
+    /// near 8 s.</summary>
+    private const double MinSecondsBetweenAreaChanges = 6;
+
+    /// <summary>Alert-only watchdogs: each sends one webhook, none acts.</summary>
+    private const int UnfocusedAlertSeconds = 120;
+    private const int LongLoadAlertSeconds = 180;
+    private const int IdleAlertSeconds = 300;
+    private const int NoProgressAlertMinutes = 20;
+    private const int RepeatedDeathsPerRun = 3;
+
     private readonly IFarmStrategy _strategy;
     private readonly NavigationService _navigation;
     private readonly GameStateService _gameState;
@@ -65,8 +88,50 @@ public sealed class FarmingEngine
     private int _stashBackoffLevel;
     private bool _stashTroubleNotified;
     private int _restockRetries;
+
+    /// <summary>A death since the last hideout pass: the Omen of Amelioration may
+    /// have been consumed, so a run still in progress gets ONE trip to the stash
+    /// for a new omen before re-entering. Cleared by the next hideout pass.</summary>
+    private bool _omenTripAfterDeath;
+
+    /// <summary>The Stashing state was entered for the death trip — fetch the omen
+    /// ONLY. Set by the hideout pass that decides on the trip and lowered by every
+    /// hideout pass, so it survives an interrupted (re-run) step but can never
+    /// turn the regular chores between runs into an omen-only visit.</summary>
+    private bool _omenOnlyTrip;
+
+    /// <summary>The fragment tab read empty once. A false "empty" ends a whole
+    /// night of farming while a real one costs one more look, so the session
+    /// only ends when a second, fresh stash session agrees.</summary>
+    private bool _fragmentTabReadEmpty;
+
+    /// <summary>Farm-portal ids standing when the current map-device preparation
+    /// began (null = none in progress). Survives an interrupted step so its re-run
+    /// can tell that Activate already went through; any run start clears it.</summary>
+    private HashSet<uint>? _portalsBeforePreparation;
+
     private int _mapDeviceFailuresInARow;
     private bool _mapDeviceTroubleNotified;
+    private int _portalEntryFailuresInARow;
+    private bool _portalEntryTroubleNotified;
+    private int _returnFailuresInARow;
+    private bool _returnTroubleNotified;
+
+    // Focus gate: no input may go out while the game window is not in front.
+    private long _unfocusedSince = Clock.Never;
+    private bool _unfocusedNotified;
+
+    private long _loadingSince = Clock.Never;
+    private bool _longLoadNotified;
+    private long _idleSince = Clock.Never;
+    private bool _idleNotified;
+
+    // Engine-wide progress watchdog (state, phase, portals, waves, runs).
+    private int _progressHash;
+    private long _progressAt = Clock.NowMs;
+    private bool _noProgressNotified;
+
+    private bool _repeatedDeathsNotified;
 
     // Stray-panel watchdog (in-map): Escape presses are throttled, and only a
     // panel that survives several of them is worth a webhook.
@@ -87,6 +152,14 @@ public sealed class FarmingEngine
     public IFarmStrategy Strategy => _strategy;
     public RunContext Context { get; } = new();
 
+    /// <summary>"Stop after this run", armed from the settings UI. The live run
+    /// (if any) is finished as usual — re-entries after deaths or stash trips
+    /// included — and the session ends at the first point where no run is
+    /// active: home in the hideout, BEFORE the hideout chores, so no fresh
+    /// fragment is restocked for a run that will not happen. Per session: a new
+    /// engine is built on every Start.</summary>
+    public bool StopAfterRun { get; set; }
+
     /// <summary>Cancellation for the CURRENTLY RUNNING state-handler step —
     /// linked to the master token. Cancelled from the plugin's Tick when a
     /// death/disconnect happens mid-handler (the engine loop itself cannot see
@@ -98,18 +171,34 @@ public sealed class FarmingEngine
     /// state handler is awaiting inside this SyncTask.</summary>
     public bool NeedsRecoveryInterrupt => _recovery.ShouldRecover(CurrentState, out _);
 
+    /// <summary>Whether the game window lost focus while a state that sends input
+    /// runs. Polled from the plugin's Tick like <see cref="NeedsRecoveryInterrupt"/>:
+    /// a step mid-await would otherwise keep sending keys and clicks to whatever
+    /// window is in front now.</summary>
+    public bool NeedsFocusInterrupt => FocusGateApplies(CurrentState) && !InputReachesGame;
+
+    /// <summary>OS input only reaches the game while its window is in front;
+    /// background input always does.</summary>
+    private bool InputReachesGame => _gameState.IsWindowForeground || _input.IsBackgroundInput;
+
+    /// <summary>States that never send game input (or, Disconnected, gate on
+    /// focus themselves) are exempt from the focus pause.</summary>
+    private static bool FocusGateApplies(BotState state) =>
+        state is not (BotState.Idle or BotState.Disconnected or BotState.Finished or BotState.Error);
+
     /// <summary>
     /// Cancel the current state-handler step (NOT the whole engine): the handler
-    /// unwinds, the main loop regains control, and its recovery check performs
-    /// the actual Dead/Disconnected transition with the run context intact.
-    /// Same-thread with the SyncTask pump, so no races. No-op when nothing runs.
+    /// unwinds, the main loop regains control, and its recovery check / focus
+    /// gate takes over with the run context intact. Handlers are re-run from the
+    /// top afterwards. Same-thread with the SyncTask pump, so no races. No-op
+    /// when nothing runs or the step is already cancelled.
     /// </summary>
-    public void InterruptForRecovery()
+    public void InterruptStep(string reason)
     {
         var step = _stepCts;
         if (step is { IsCancellationRequested: false })
         {
-            _log("Recovery interrupt -- cancelling the current action.");
+            _log($"{reason} -- cancelling the current action.");
             step.Cancel();
         }
     }
@@ -144,9 +233,26 @@ public sealed class FarmingEngine
         {
             _sessionStartedAt = Clock.NowMs;
             _sessionStartDeaths = _stats.Deaths;
+
+            // The bot is the one input driver for the whole session: take
+            // InputHumanizer's lock up front (waiting briefly for a plugin that
+            // still holds it) instead of per click, so nothing can slip a cursor
+            // move between a hover and its click.
+            if (!await _input.BeginSession(TimeSpan.FromSeconds(10), ct))
+            {
+                var why = _input.IsAvailable
+                    ? "another plugin kept the InputHumanizer lock for 10s"
+                    : "InputHumanizer is not available";
+                _log($"Cannot start: {why}.");
+                _webhook.NotifyCritical("Bot error", $"Could not take the input lock -- {why}.");
+                CurrentState = BotState.Error;
+                return false;
+            }
+
             _strategy.Reset();
+            _chores.ArmOmenRestock(); // a new session looks in the restock tab again
             CurrentState = DetectInitialState();
-            _log($"Engine starting. Strategy: {_strategy.Name}, State: {CurrentState}");
+            _log($"Started: {_strategy.Name} ({CurrentState}).");
 
             while (!ct.IsCancellationRequested && CurrentState != BotState.Error)
             {
@@ -163,15 +269,30 @@ public sealed class FarmingEngine
                     // ShouldRecover fires once per transition (never while already
                     // in a recovery state), so this counts each death exactly once.
                     if (recoveryState == BotState.Dead)
+                    {
                         _stats.Deaths++;
-                    await _navigation.ReleaseMoveKey();
+                        NoteDeathForRun();
+                        // The death may have consumed the Omen of Amelioration.
+                        _chores.ArmOmenRestock();
+                        _omenTripAfterDeath = true;
+                    }
+                    await _navigation.ReleaseAllKeys();
                     CurrentState = recoveryState;
                 }
 
                 // Loading screens pause the loop -- except while disconnected,
                 // where the handler itself must keep driving the login flow.
                 if (_gameState.IsLoading && CurrentState != BotState.Disconnected)
+                {
+                    WatchLongLoad();
                     continue;
+                }
+                _loadingSince = Clock.Never;
+
+                if (await HoldWhileUnfocused())
+                    continue;
+
+                WatchProgress();
 
                 // Each handler step runs under its own linked token so the
                 // plugin's Tick can interrupt a mid-await handler (death or
@@ -185,7 +306,7 @@ public sealed class FarmingEngine
                     var stepCt = stepCts.Token;
                     CurrentState = CurrentState switch
                     {
-                        BotState.Idle => DetectInitialState(),
+                        BotState.Idle => DoIdle(),
                         BotState.InHideout => DoInHideout(),
                         BotState.Stashing => await DoStashing(stepCt),
                         BotState.PreparingMap => await DoPreparingMap(stepCt),
@@ -193,7 +314,7 @@ public sealed class FarmingEngine
                         BotState.EnteringMap => await DoEnteringMap(stepCt),
                         BotState.RunningFarm => await DoRunningFarm(stepCt),
                         BotState.ReturningToHideout => await DoReturningToHideout(stepCt),
-                        BotState.Dead => await _recovery.HandleDeath(stepCt),
+                        BotState.Dead => await DoDead(stepCt),
                         BotState.Disconnected => await DoDisconnected(stepCt),
                         BotState.Finished => BotState.Finished,
                         _ => BotState.Error
@@ -201,9 +322,10 @@ public sealed class FarmingEngine
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                 {
-                    // Step interrupted for recovery — state unchanged; the next
-                    // iteration's ShouldRecover transitions to Dead/Disconnected.
-                    await _navigation.ReleaseMoveKey();
+                    // Step interrupted (recovery or lost focus) — state unchanged;
+                    // the next iteration's ShouldRecover / focus gate takes over.
+                    // The cut-short step may have left Ctrl/Shift down too.
+                    await _navigation.ReleaseAllKeys();
                 }
                 finally
                 {
@@ -212,7 +334,7 @@ public sealed class FarmingEngine
 
                 if (CurrentState == BotState.Finished)
                 {
-                    _log($"Engine finished. Runs completed: {Context.RunsCompleted}.");
+                    _log($"Finished: {Context.RunsCompleted} runs completed.");
                     break;
                 }
             }
@@ -230,7 +352,8 @@ public sealed class FarmingEngine
         }
         finally
         {
-            await _navigation.ReleaseMoveKey();
+            await _navigation.ReleaseAllKeys();
+            _input.EndSession();
         }
 
         if (ct.IsCancellationRequested)
@@ -240,7 +363,7 @@ public sealed class FarmingEngine
         else if (CurrentState == BotState.Error)
             _webhook.NotifyCritical("Bot error", "Engine entered the Error state.");
 
-        _log($"Engine stopped. Final state: {CurrentState}");
+        _log($"Stopped ({CurrentState}).");
         return CurrentState != BotState.Error;
     }
 
@@ -253,6 +376,173 @@ public sealed class FarmingEngine
         _runStartedAt = Clock.NowMs;
         _runStartDeaths = _stats.Deaths;
         _runStartGems = _stats.GemsLeveled;
+        _repeatedDeathsNotified = false;
+        // A run starting (activated, adopted, or entered mid-map) accounts for
+        // any portals an interrupted preparation opened — never let that
+        // snapshot outlive it and vouch for a LATER run's portals.
+        _portalsBeforePreparation = null;
+    }
+
+    /// <summary>
+    /// Focus gate: with the game window out of front, every key and click would
+    /// land in whatever window is there now (unless background input is on, which
+    /// goes straight to the game). Holds the loop (the plugin's Tick has already
+    /// interrupted any running step) until focus is back, then the state's handler
+    /// resumes from the top. True = holding this frame.
+    /// </summary>
+    private async SyncTask<bool> HoldWhileUnfocused()
+    {
+        if (!FocusGateApplies(CurrentState) || InputReachesGame)
+        {
+            if (_unfocusedSince != Clock.Never)
+            {
+                _log($"Game window is back in front -- resuming ({CurrentState}).");
+                _unfocusedSince = Clock.Never;
+                _unfocusedNotified = false;
+            }
+            return false;
+        }
+
+        _progressAt = Clock.NowMs; // a pause is not a stall
+        if (_unfocusedSince == Clock.Never)
+        {
+            _unfocusedSince = Clock.NowMs;
+            _log("Game window lost focus -- pausing until it is back in front.");
+            await _navigation.ReleaseAllKeys();
+        }
+        else if (!_unfocusedNotified && Clock.SecondsSince(_unfocusedSince) > UnfocusedAlertSeconds)
+        {
+            _unfocusedNotified = true;
+            _webhook.NotifyCritical("Paused: game not focused",
+                $"The game window has been out of focus for {UnfocusedAlertSeconds / 60} minutes -- the bot " +
+                "is paused (no input can reach the game). Bring the game window to the front to resume.");
+        }
+
+        return true;
+    }
+
+    /// <summary>A loading screen that never ends is a hang the loop cannot see
+    /// (it just keeps waiting). Alert once; recovery still owns disconnects.</summary>
+    private void WatchLongLoad()
+    {
+        _progressAt = Clock.NowMs; // loading is not a stall of ours
+        if (_loadingSince == Clock.Never)
+        {
+            _loadingSince = Clock.NowMs;
+            _longLoadNotified = false;
+            return;
+        }
+
+        if (!_longLoadNotified && Clock.SecondsSince(_loadingSince) > LongLoadAlertSeconds)
+        {
+            _longLoadNotified = true;
+            _log($"Loading screen for over {LongLoadAlertSeconds / 60} minutes ({CurrentState}).");
+            _webhook.NotifyCritical("Stuck loading",
+                $"A loading screen has lasted over {LongLoadAlertSeconds / 60} minutes ({CurrentState}). " +
+                "The bot keeps waiting; the game may need a hand.");
+        }
+    }
+
+    /// <summary>
+    /// Engine-wide watchdog. Every handler bounds itself, but handlers chained
+    /// together can still cycle without getting anywhere — state and phase
+    /// changes are exactly what such a cycle produces, so they do NOT count.
+    /// Progress is an outcome: a portal used, a wave started, a run completed,
+    /// a death. Skipped in the states that alert on their own (Idle,
+    /// Disconnected, Dead). Alert-only: the strategy's abandon timer stays in
+    /// charge of ending a run.
+    /// </summary>
+    private void WatchProgress()
+    {
+        if (CurrentState is BotState.Idle or BotState.Disconnected or BotState.Dead)
+        {
+            _progressAt = Clock.NowMs;
+            return;
+        }
+
+        var hash = HashCode.Combine(Context.PortalsUsed, Context.WavesStarted,
+            Context.RunsCompleted, _stats.Deaths);
+        if (hash != _progressHash)
+        {
+            _progressHash = hash;
+            _progressAt = Clock.NowMs;
+            _noProgressNotified = false;
+            return;
+        }
+
+        if (_noProgressNotified || Clock.SecondsSince(_progressAt) < NoProgressAlertMinutes * 60)
+            return;
+
+        _noProgressNotified = true;
+        _log($"No progress for {NoProgressAlertMinutes} minutes ({CurrentState} / {_strategy.CurrentPhaseName}).");
+        _webhook.NotifyCritical("No progress",
+            $"Nothing has changed for {NoProgressAlertMinutes} minutes (state {CurrentState}, " +
+            $"phase {_strategy.CurrentPhaseName}). The bot keeps going, but may be stuck.");
+    }
+
+    /// <summary>Several deaths in one run usually mean something is off (build,
+    /// ReAgent rules, a bad map mod) — say so once per run.</summary>
+    private void NoteDeathForRun()
+    {
+        var deathsThisRun = _stats.Deaths - _runStartDeaths;
+        if (!Context.RunActive || _repeatedDeathsNotified || deathsThisRun < RepeatedDeathsPerRun)
+            return;
+
+        _repeatedDeathsNotified = true;
+        _webhook.NotifyCritical("Repeated deaths",
+            $"{deathsThisRun} deaths in the current run ({Context.PortalsRemaining} portals left). " +
+            "Re-entering continues -- check the build / ReAgent rules if this keeps happening.");
+    }
+
+    /// <summary>Idle = started (or landed) somewhere the bot has no route from.
+    /// Re-detects every frame as before, but says so instead of waiting silently.</summary>
+    private BotState DoIdle()
+    {
+        // Idle never has a run of ours to finish -- an armed stop applies now.
+        if (StopAfterRun && !Context.RunActive)
+            return StopAsRequested();
+
+        var next = DetectInitialState();
+        if (next != BotState.Idle)
+        {
+            _idleSince = Clock.Never;
+            _idleNotified = false;
+            return next;
+        }
+
+        if (_idleSince == Clock.Never)
+        {
+            _idleSince = Clock.NowMs;
+            _log($"Waiting: not in the hideout, a town or the farm area ('{_gameState.AreaName}').");
+        }
+        else if (!_idleNotified && Clock.SecondsSince(_idleSince) > IdleAlertSeconds)
+        {
+            _idleNotified = true;
+            _webhook.NotifyCritical("Bot idle",
+                $"Waiting for {IdleAlertSeconds / 60} minutes in '{_gameState.AreaName}' -- the bot only " +
+                "starts from the hideout, a town or the farm area.");
+        }
+
+        return BotState.Idle;
+    }
+
+    /// <summary>The armed "stop after this run" ends the session (Finished, so
+    /// the session summary goes out and tells the user it is done).</summary>
+    private BotState StopAsRequested()
+    {
+        _log("No run in progress -- stopping as requested (stop after this run).");
+        _finishReason = "Stopped after the current run (requested).";
+        return BotState.Finished;
+    }
+
+    /// <summary>Thin wrapper so a death give-up (Finished) carries a session
+    /// summary reason, like <see cref="DoDisconnected"/>.</summary>
+    private async SyncTask<BotState> DoDead(CancellationToken ct)
+    {
+        var next = await _recovery.HandleDeath(ct);
+        if (next == BotState.Finished)
+            _finishReason = "Stuck dead: no resurrect option worked.";
+        return next;
     }
 
     private static string FormatDuration(TimeSpan t) =>
@@ -333,6 +623,8 @@ public sealed class FarmingEngine
 
         // The entry consumed a portal even though its transition was missed.
         Context.PortalsUsed++;
+        _portalEntryFailuresInARow = 0;
+        _portalEntryTroubleNotified = false;
         var firstEntry = Context.PortalsUsed == 1;
         // We entered moments ago and have not walked anywhere on our own -- the
         // current position is the return-portal spot (kept from the first entry
@@ -367,6 +659,12 @@ public sealed class FarmingEngine
 
     private BotState DoInHideout()
     {
+        // One pass per death: the trip is decided here or not at all. Without a
+        // live run the regular chores below fetch the omen anyway.
+        var omenTrip = _omenTripAfterDeath;
+        _omenTripAfterDeath = false;
+        _omenOnlyTrip = false;
+
         // Standing inside the farm area means an entry went unconfirmed -- no
         // hideout logic applies; hand the run to the strategy.
         if (AdoptUnconfirmedMapEntry())
@@ -394,15 +692,54 @@ public sealed class FarmingEngine
         {
             if (Context.PortalsRemaining > 0)
             {
+                // Emptying the inventory is the whole reason a strategy asks for
+                // a hideout trip mid-run (its in-area stash could not be opened).
+                // Re-entering before the dump would send the bot straight back
+                // into the deadlock it just spent a portal to escape — so the
+                // chores run FIRST and the re-entry happens on the next pass.
+                // UrgentStashPending covers the same need for the paths that
+                // never raised the flag (a death, a manual restart).
+                // A requested trip ignores the chore backoff: it was paid for with
+                // a portal and costs exactly one attempt (DoStashing consumes the
+                // flag) — skipping it would re-enter still full.
+                if (Context.StashTripRequested ||
+                    (_chores.UrgentStashPending && Clock.Reached(_stashBackoffUntil)))
+                {
+                    if (_chores.ConfigErrorStanding && StopForConfigErrorWithFullInventory() is { } stopNow)
+                        return stopNow;
+
+                    _log("Run still active but the inventory needs emptying -- stashing before re-entering.");
+                    return BotState.Stashing;
+                }
+
+                // The death consumed the Omen of Amelioration: fetch a new one
+                // before going back in -- the omen ONLY (no fragment restock, no
+                // dump, no gems). Exactly one attempt (the flag is gone after
+                // this pass), so a failed fetch cannot hold the re-entry hostage.
+                // The chores between runs try again.
+                if (omenTrip && Clock.Reached(_stashBackoffUntil) &&
+                    _chores.OmenRestockPending(_strategy.RestockTabName))
+                {
+                    _log("Died -- fetching a new Omen of Amelioration before re-entering.");
+                    _omenOnlyTrip = true;
+                    return BotState.Stashing;
+                }
+
                 _log($"Run still active, {Context.PortalsRemaining} portals left. Re-entering.");
                 _portalWaitStartedAt = Clock.NowMs;
                 return BotState.WaitingForPortal;
             }
 
             _log("Run abandoned -- no portals left.");
-            _webhook.NotifyCritical("Run abandoned", "No portals left to re-enter -- starting a fresh run.");
+            _webhook.NotifyCritical("Run abandoned", StopAfterRun
+                ? "No portals left to re-enter -- stopping as requested (stop after this run)."
+                : "No portals left to re-enter -- starting a fresh run.");
             Context.RunActive = false;
         }
+
+        // No run is live past this point -- the requested stop lands here.
+        if (StopAfterRun)
+            return StopAsRequested();
 
         if (_chores.ConfigErrorStanding && StopForConfigErrorWithFullInventory() is { } stop)
             return stop;
@@ -427,16 +764,46 @@ public sealed class FarmingEngine
 
     private async SyncTask<BotState> DoStashing(CancellationToken ct)
     {
-        _log("Running hideout chores (stash / gems / fragments)...");
-        var result = await _chores.Run(_strategy.MapDeviceItemPaths, _strategy.RestockTabName, ct);
+        if (_omenOnlyTrip)
+            return await DoOmenOnlyTrip(ct);
+
+        BotLog.Step("Running hideout chores (stash / gems / fragments / omen)...");
+
+        // A strategy that came home ONLY to empty its inventory gets the dump
+        // whether or not the last cell is taken. Consumed once the attempt
+        // RETURNS, so the request costs exactly one attempt: if that attempt
+        // cannot fix it, the run resumes instead of looping the hideout states.
+        // (An attempt cut short — lost focus — is re-run with the flag intact.)
+        var forceStash = Context.StashTripRequested;
+
+        var result = await _chores.Run(
+            _strategy.MapDeviceItemPaths, _strategy.RestockTabName, ct, forceStash);
+        Context.StashTripRequested = false;
         switch (result)
         {
             case ChoresResult.OutOfFragments:
-                _log("Fragment input tab is empty -- farming session complete.");
+                // The next fragment is only needed for the NEXT run -- a live run
+                // with portals left is finished first.
+                if (Context.RunActive && Context.PortalsRemaining > 0)
+                {
+                    _log("Fragment tab reads empty, but the current run is still live -- finishing it first.");
+                    break;
+                }
+
+                if (!_fragmentTabReadEmpty)
+                {
+                    _fragmentTabReadEmpty = true;
+                    _log("Fragment tab reads empty -- reopening the stash to confirm before ending the session.");
+                    await Task.Delay(2000, ct);
+                    break;
+                }
+
+                _log("Fragment input tab is empty (confirmed twice) -- farming session complete.");
                 _finishReason = "Fragment input tab empty.";
                 return BotState.Finished;
 
             case ChoresResult.Done:
+                _fragmentTabReadEmpty = false;
                 _stashFailuresInARow = 0;
                 _stashBackoffLevel = 0;
                 _stashTroubleNotified = false;
@@ -526,6 +893,37 @@ public sealed class FarmingEngine
         return BotState.InHideout;
     }
 
+    /// <summary>
+    /// The death trip: one attempt at the omen, then back to the hideout pass,
+    /// which re-enters the live run whatever the outcome. Deliberately outside
+    /// the chore failure counters and backoff — those pace the full chores, and
+    /// one failed omen pull must not delay the next loot dump.
+    /// </summary>
+    private async SyncTask<BotState> DoOmenOnlyTrip(CancellationToken ct)
+    {
+        BotLog.Step("Fetching an Omen of Amelioration (omen only)...");
+        var result = await _chores.RestockOmenOnly(_strategy.RestockTabName, ct);
+        _omenOnlyTrip = false;
+        switch (result)
+        {
+            case ChoresResult.Failed:
+                _log($"Could not fetch an Omen of Amelioration ({_chores.LastFailureDetail ?? "unknown step"}) " +
+                     "-- re-entering without one; the chores between runs try again.");
+                break;
+
+            case ChoresResult.ConfigError:
+            {
+                var detail = _chores.LastFailureDetail ?? "The restock tab was not found.";
+                _log($"Omen fetch blocked by a settings problem -- {detail} Re-entering without one.");
+                _webhook.NotifyCritical("Stash settings problem",
+                    $"{detail} Stashing is paused until the settings change -- retrying cannot fix a wrong tab name.");
+                break;
+            }
+        }
+
+        return BotState.InHideout;
+    }
+
     private async SyncTask<BotState> DoPreparingMap(CancellationToken ct)
     {
         if (_strategy.MapDeviceItemPaths.Count == 0)
@@ -535,9 +933,29 @@ public sealed class FarmingEngine
             return BotState.WaitingForPortal;
         }
 
-        _log("Preparing map device...");
-        var result = await _mapDevice.PrepareAndActivate(
-            _strategy.MapDeviceItemPaths, _strategy.IsFarmArea, ct);
+        // A preparation cut short AFTER its Activate click (lost focus during the
+        // portal wait or the UI-close waits) is re-run from the top — which would
+        // slot and burn a second fragment while the first run's portals stand
+        // unused. The farm portals standing when the preparation began are kept
+        // across such re-runs: anything new means the activation already happened.
+        MapDeviceResult result;
+        if (_portalsBeforePreparation is { } before &&
+            _gameState.FindFarmPortals(_strategy.IsFarmArea).Any(p => !before.Contains(p.Id)))
+        {
+            _log("The interrupted activation already opened new portals -- not activating again.");
+            result = MapDeviceResult.Success;
+        }
+        else
+        {
+            _portalsBeforePreparation ??= _gameState.FindFarmPortals(_strategy.IsFarmArea)
+                .Select(p => p.Id)
+                .ToHashSet();
+            BotLog.Step("Preparing map device...");
+            result = await _mapDevice.PrepareAndActivate(
+                _strategy.MapDeviceItemPaths, _strategy.IsFarmArea, ct);
+        }
+
+        _portalsBeforePreparation = null; // this preparation returned (any result)
 
         switch (result)
         {
@@ -548,6 +966,8 @@ public sealed class FarmingEngine
                 _restockRetries = 0;
                 _mapDeviceFailuresInARow = 0;
                 _mapDeviceTroubleNotified = false;
+                _portalEntryFailuresInARow = 0;
+                _portalEntryTroubleNotified = false;
                 _areas.IgnorePortalsOfCompletedRun = false; // fresh portals from here on
                 _portalWaitStartedAt = Clock.NowMs;
                 return BotState.WaitingForPortal;
@@ -680,15 +1100,32 @@ public sealed class FarmingEngine
             return BotState.WaitingForPortal;
         }
 
-        var portal = portals[0];
-        _log($"Entering portal ({portal.GetComponent<ExileCore.PoEMemory.Components.Render>()?.Name ?? "?"})...");
-        await _navigation.ClickEntity(portal, ct);
+        // The host skips its area refresh when an area change comes less than
+        // ~5 s after the previous one. A death re-entry (checkpoint resurrect,
+        // then straight back in) used to land 2-4 s after the hideout arrival,
+        // so the map ran on unrefreshed host data. On 2026-11-17 that left the
+        // return portal unclickable for the whole retry budget. Let the hideout
+        // arrival age past the window before clicking.
+        var settle = MinSecondsBetweenAreaChanges - _gameState.SecondsSinceAreaChange;
+        if (settle > 0)
+        {
+            BotLog.Step($"Letting the host settle the area change ({settle:0.0}s) before entering...");
+            await Task.Delay(TimeSpan.FromSeconds(settle), ct);
+            return BotState.EnteringMap; // re-read the portals after the wait
+        }
 
-        // Wait for the transition to land in a farm area.
-        if (await WaitForAreaTransition(
+        var portal = portals[0];
+        BotLog.Step($"Entering portal ({portal.GetComponent<ExileCore.PoEMemory.Components.Render>()?.Name ?? "?"})...");
+        var clicked = await _navigation.ClickEntity(portal, ct);
+
+        // Wait for the transition to land in a farm area. A click that never went
+        // out cannot transition — skip the 12 s wait and its forced area refresh.
+        if (clicked && await WaitForAreaTransition(
                 () => _gameState.IsReady && _strategy.IsFarmArea(_gameState.AreaName), 12, ct))
         {
             Context.PortalsUsed++;
+            _portalEntryFailuresInARow = 0;
+            _portalEntryTroubleNotified = false;
             // We stand at the return portals right now -- remember the spot.
             Context.MapEntryPoint = _gameState.PlayerGridPos;
             var firstEntry = Context.PortalsUsed == 1;
@@ -698,7 +1135,44 @@ public sealed class FarmingEngine
             return BotState.RunningFarm;
         }
 
-        _log("Portal click did not lead into the map, retrying...");
+        return await PortalEntryFailed(clicked
+            ? "the click did not lead into the map"
+            : "the portal could not be clicked", ct);
+    }
+
+    /// <summary>
+    /// Same failsafe shape as the map device: WaitingForPortal hands straight back
+    /// to EnteringMap while a portal is visible, so without a count a portal that
+    /// keeps refusing would loop forever. Reset the UI between attempts (a panel
+    /// swallowing the click is the usual cause), alert once, and stop loudly.
+    /// </summary>
+    private async SyncTask<BotState> PortalEntryFailed(string why, CancellationToken ct)
+    {
+        _portalEntryFailuresInARow++;
+
+        if (_portalEntryFailuresInARow >= MaxPortalEntryFailures)
+        {
+            _log($"Portal entry failed {_portalEntryFailuresInARow}x in a row ({why}) -- stopping.");
+            _webhook.NotifyCritical("Portal entry failing",
+                $"Entering the map failed {_portalEntryFailuresInARow}x in a row ({why}) -- stopping the " +
+                "session. Check the hideout portals manually.");
+            _finishReason = "Portal entry kept failing.";
+            return BotState.Finished;
+        }
+
+        if (_portalEntryFailuresInARow == 3 && !_portalEntryTroubleNotified)
+        {
+            _portalEntryTroubleNotified = true;
+            _webhook.NotifyCritical("Portal trouble",
+                $"Entering the map has failed 3x in a row ({why}) -- resetting the UI and retrying; " +
+                $"will stop after {MaxPortalEntryFailures} failures.");
+        }
+
+        _log($"Portal entry failed ({why}) -- attempt {_portalEntryFailuresInARow}/{MaxPortalEntryFailures}, " +
+             "resetting the UI and retrying.");
+        await _mapDevice.ResetUi(ct);
+        await Task.Delay(_portalEntryFailuresInARow >= 3 ? 5000 : 1000, ct);
+        _portalWaitStartedAt = Clock.NowMs;
         return BotState.WaitingForPortal;
     }
 
@@ -775,7 +1249,7 @@ public sealed class FarmingEngine
 
         if (farmComplete)
         {
-            _log("Farm objective complete!");
+            BotLog.Step("Farm objective complete!");
             Context.RunActive = false;
             Context.RunsCompleted++;
             _areas.IgnorePortalsOfCompletedRun = true; // leftovers lead into the finished map
@@ -802,34 +1276,44 @@ public sealed class FarmingEngine
         {
             _log("Back in hideout.");
             _noReturnPortalNotified = false;
+            _returnFailuresInARow = 0;
+            _returnTroubleNotified = false;
             return BotState.InHideout;
         }
 
         // Town has no portals of ours -- the hideout keybind is the way home.
         if (_gameState.IsInTown)
         {
-            await _recovery.TryTownToHideout(ct);
-            await Task.Delay(1000, ct);
+            if (!await _recovery.TryTownToHideout(ct))
+                return await ReturnFailed("the hideout key did not leave town (is it bound to /hideout?)", ct);
             return BotState.ReturningToHideout;
         }
 
-        // In the farm area: take the nearest town portal back.
-        var portals = _gameState.GetTownPortals();
+        // In the farm area: take the nearest town portal back. The host's list
+        // order is arbitrary, so sort by distance.
+        var playerPos = _gameState.PlayerGridPos;
+        var portals = _gameState.GetTownPortals()
+            .OrderBy(p => System.Numerics.Vector2.Distance(playerPos, p.GridPosNum))
+            .ToList();
         if (portals.Count > 0)
         {
-            _log("Taking portal back to hideout...");
-            await _navigation.ClickEntity(portals[0], ct);
+            BotLog.Step("Taking portal back to hideout...");
+            var clicked = await _navigation.ClickEntity(portals[0], ct);
 
-            if (await WaitForAreaTransition(
+            if (clicked && await WaitForAreaTransition(
                     () => _gameState.IsInHideout || _gameState.IsInTown, 12, ct))
                 return BotState.ReturningToHideout; // re-evaluates: hideout exits, town presses the key
+
+            return await ReturnFailed(clicked
+                ? "the portal click did not lead out of the map"
+                : "the return portal could not be clicked", ct);
         }
         else if (Context.MapEntryPoint is { } entry &&
                  _strategy.IsFarmArea(_gameState.AreaName) &&
                  System.Numerics.Vector2.Distance(_gameState.PlayerGridPos, entry) > 30)
         {
             // The return portals stand at the map entry but stream in only when close.
-            _log("Walking back to the map entry point...");
+            BotLog.Step("Walking back to the map entry point...");
             await _navigation.MoveToTarget(entry, ct, 25);
         }
         else if (_gameState.IsReady && _strategy.IsFarmArea(_gameState.AreaName))
@@ -866,6 +1350,52 @@ public sealed class FarmingEngine
     }
 
     /// <summary>
+    /// Failsafe for the way home (town portal click, hideout key): count, reset
+    /// the UI between attempts, alert once, and stop loudly instead of retrying
+    /// all night. Searching for a portal that is not in sight is not a failure —
+    /// the exploration branch has its own alert.
+    /// </summary>
+    private async SyncTask<BotState> ReturnFailed(string why, CancellationToken ct)
+    {
+        _returnFailuresInARow++;
+
+        if (_returnFailuresInARow >= MaxReturnFailures)
+        {
+            _log($"Getting back to the hideout failed {_returnFailuresInARow}x in a row ({why}) -- stopping.");
+            _webhook.NotifyCritical("Cannot get home",
+                $"Returning to the hideout failed {_returnFailuresInARow}x in a row ({why}) -- stopping " +
+                $"the session in '{_gameState.AreaName}'.");
+            _finishReason = "Returning to the hideout kept failing.";
+            return BotState.Finished;
+        }
+
+        if (_returnFailuresInARow == 3 && !_returnTroubleNotified)
+        {
+            _returnTroubleNotified = true;
+            _webhook.NotifyCritical("Trouble getting home",
+                $"Returning to the hideout has failed 3x in a row ({why}) -- retrying; " +
+                $"will stop after {MaxReturnFailures} failures.");
+        }
+
+        _log($"Return failed ({why}) -- attempt {_returnFailuresInARow}/{MaxReturnFailures}, retrying.");
+        await _mapDevice.ResetUi(ct);
+
+        // Retrying against the same host data repeats the same failure. On
+        // 2026-11-17 the portal stood next to the character but projected
+        // off-screen 10x in a row, while a manual click worked. From the second
+        // failure, rebuild the host's caches (throttled to once per 10 s
+        // inside) before the next attempt.
+        if (_returnFailuresInARow >= 2 && _gameState.TryForceRefreshArea())
+        {
+            _log("Forced an area refresh to rule out stale host data before retrying.");
+            await Task.Delay(1000, ct);
+        }
+
+        await Task.Delay(_returnFailuresInARow >= 3 ? 5000 : 1000, ct);
+        return BotState.ReturningToHideout;
+    }
+
+    /// <summary>
     /// Frame-checked wait for a post-click area transition: skips loading frames
     /// and returns true as soon as the arrival condition holds. Loading screens
     /// do not consume the confirmation window -- a Simulacrum load alone can
@@ -891,6 +1421,10 @@ public sealed class FarmingEngine
 
             if (arrived()) return true;
         }
+
+        // Stopped or interrupted is not "timed out" — never force a host area
+        // refresh (an AreaChange in every plugin) on the way out.
+        ct.ThrowIfCancellationRequested();
 
         // Timed out: the transition may have HAPPENED without the host noticing
         // (missed area change leaves CurrentArea/entities stale while IsReady

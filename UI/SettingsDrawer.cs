@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Numerics;
 using ExileCore.Shared.Nodes;
 using ImGuiNET;
 using NightmareAutomate.Enums;
@@ -47,6 +48,9 @@ public class SettingsDrawer
 
     private void DrawMainTab()
     {
+        DrawSessionControls();
+
+        ImGui.Spacing();
         ImGui.SeparatorText("Farm");
 
         foreach (var farmType in Enum.GetValues<FarmType>())
@@ -71,10 +75,43 @@ public class SettingsDrawer
             "Stash tab to restock Simulacrums from when the map device and its storage run out. " +
             "'(none)' = no restocking; the session ends when out of fragments.");
 
+        _s.KeepOmenOfAmelioration = Toggle("Keep Omen of Amelioration", _s.KeepOmenOfAmelioration,
+            "Never stash an Omen of Amelioration: it stays in the inventory. When a death " +
+            "consumes it, the bot takes a new one from the Simulacrum Tab before re-entering. " +
+            "If the tab has none, it carries on without one and looks again after the next death. " +
+            "Replacing the omen needs the Simulacrum Tab set. Only one omen is consumed per " +
+            "Simulacrum, so later deaths in the same run leave the new one in the inventory.");
+
         ImGui.Spacing();
         ImGui.SeparatorText("Dump Tabs");
 
         DrawDumpTabPicker();
+    }
+
+    /// <summary>
+    /// "Stop after this run" toggle with its live state next to it. Disabled while
+    /// the bot is not running (nothing to finish).
+    /// </summary>
+    private void DrawSessionControls()
+    {
+        ImGui.SeparatorText("Session");
+
+        var pending = _s.StopAfterRunPending?.Invoke(); // null = bot not running
+
+        ImGui.BeginDisabled(pending == null);
+        if (ImGui.Button(pending == true ? "Cancel Stop After Run" : "Stop After This Run"))
+            _s.ToggleStopAfterRun?.Invoke();
+        ImGui.EndDisabled();
+        HelpMarker("Let the bot finish the run it is on -- re-entering after deaths or stash trips " +
+                   "as usual -- then stop in the hideout. If it is opening a new map right now, that " +
+                   "run is the one it finishes. Nothing new is started or restocked afterwards. " +
+                   "Click again to cancel; the Start / Stop hotkey still stops immediately.");
+
+        ImGui.SameLine();
+        if (pending == null)
+            ImGui.TextDisabled("bot not running");
+        else if (pending == true)
+            ImGui.TextColored(new Vector4(1f, 0.75f, 0.3f, 1f), "stopping after the current run");
     }
 
     /// <summary>
@@ -219,6 +256,16 @@ public class SettingsDrawer
 
         ImGui.SeparatorText("General");
 
+        _s.UseBackgroundInput = Toggle("Use Background Input", _s.UseBackgroundInput,
+            "Keep running while the game window isn't focused. Needs PoeProxyDX12's background " +
+            "input module in the game and 'Use Background Input' on in InputHumanizer. Without those " +
+            "the bot pauses when focus is lost, so no input can land in another window.");
+        if (_s.BackgroundInputMismatch?.Invoke() == true)
+            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f),
+                "Off in InputHumanizer: the bot will still pause when the game isn't focused.");
+        _s.HideHudWhileUnfocused = Toggle("Hide HUD While Unfocused", _s.HideHudWhileUnfocused,
+            "Takes the HUD's overlay off the screen while another window is in front, so it " +
+            "doesn't draw over it. The HUD and its plugins keep running.");
         _s.MoveCloseToProximityShieldRares = Toggle("Engage Proximity Rares Close",
             _s.MoveCloseToProximityShieldRares,
             "Engage rares with a Temporal Bubble aura (MonsterModTemporalAura) " +
@@ -235,6 +282,9 @@ public class SettingsDrawer
 
         ImGui.SeparatorText("Debug");
 
+        _s.VerboseLogs = Toggle("Verbose Logs", _s.VerboseLogs,
+            "Also writes every routine step to Logs\\Info*.log, not only outcomes and problems. " +
+            "Turn it on when diagnosing a failure.");
         if (ImGui.Button("Dump Atlas UI (to log)"))
             _s.DumpAtlasUi?.Invoke();
         HelpMarker("Writes the visible Atlas UI tree (element paths, rects, textures, bound " +
